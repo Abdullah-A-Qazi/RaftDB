@@ -1,0 +1,11 @@
+# Binaries
+/raftd
+/raftctl
+*.test
+
+# Per-node runtime data (WAL, snapshots) — created from Phase 1 onward
+/data/
+
+# Editor/OS noise
+.DS_Store
+*.swp
