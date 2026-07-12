@@ -51,8 +51,14 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    uint64
 	Success bool
-	// ConflictIndex/ConflictTerm (the §5.3 fast-backtracking hints) join in
-	// Phase 2 together with the log consistency check that produces them.
+
+	// Fast-backtracking hints (§5.3), set only when Success is false due to
+	// a failed consistency check. ConflictTerm is the term of the
+	// follower's entry at PrevLogIndex (0 if its log is shorter than
+	// PrevLogIndex), ConflictIndex is the follower's first index carrying
+	// ConflictTerm (or its lastIndex+1 when the log was too short).
+	ConflictIndex uint64
+	ConflictTerm  uint64
 }
 
 // Transport sends RPCs to one peer. Implementations: real gRPC (package

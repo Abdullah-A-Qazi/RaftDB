@@ -18,12 +18,12 @@ vet:
 
 # Regenerate Go stubs from the .proto definitions.
 # --go_opt=module strips the module prefix so generated files land in
-# rpc/raftpb/ (matching the go_package option) instead of a nested dir.
+# rpc/raftpb/ and rpc/kvpb/ (matching the go_package options).
 proto:
 	PATH="$(PATH):$(GOBIN)" protoc \
 		--go_out=. --go_opt=module=github.com/Abdullah-A-Qazi/RaftDB \
 		--go-grpc_out=. --go-grpc_opt=module=github.com/Abdullah-A-Qazi/RaftDB \
-		rpc/raft.proto
+		rpc/raft.proto rpc/kv.proto
 
 tools:
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@latest

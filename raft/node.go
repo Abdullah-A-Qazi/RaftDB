@@ -2,18 +2,35 @@
 // consensus algorithm (Ongaro & Ousterhout, "In Search of an Understandable
 // Consensus Algorithm").
 //
-// Phase 1 implements leader election (§5.2): state transitions, randomized
-// election timeouts, heartbeats, and durable currentTerm/votedFor. Log
-// replication arrives in Phase 2, the safety rules in Phase 3.
+// Phase 1 implemented leader election (§5.2). Phase 2 adds log replication
+// (§5.3): Propose appends client commands to the leader's log, followers
+// replicate them via AppendEntries, entries commit on majority
+// acknowledgment, and committed entries are fed to a StateMachine in log
+// order. The remaining safety rules (§5.4) arrive in Phase 3.
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"time"
 )
+
+// ErrNotLeader is returned by Propose on a non-leader. The caller should
+// redirect the client to Status().LeaderID.
+var ErrNotLeader = errors.New("raft: not the leader")
+
+// StateMachine consumes committed log entries. Apply is called exactly once
+// per entry per node lifetime, in strictly ascending index order, from a
+// single goroutine — the state machine needs no locking against raft itself.
+// Raft never interprets commands; whatever Apply does must be deterministic,
+// because every node replays the same sequence and must end in the same
+// state.
+type StateMachine interface {
+	Apply(entry LogEntry)
+}
 
 // State is the role a node is currently playing (§5.1). Every node starts as
 // a follower; followers become candidates when they stop hearing from a
@@ -209,6 +226,19 @@ type RaftNode struct {
 	electionResetAt time.Time
 	electionTimeout time.Duration
 
+	// stateMachine receives committed entries (may be nil: raft still
+	// tracks lastApplied, it just has nowhere to deliver).
+	stateMachine StateMachine
+
+	// applyCond (on mu) wakes the applier goroutine whenever commitIndex
+	// advances.
+	applyCond *sync.Cond
+
+	// triggerCh kicks the leader's replication loop ahead of the next
+	// heartbeat tick — buffered(1) so a kick never blocks and repeated
+	// kicks coalesce into one round.
+	triggerCh chan struct{}
+
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 	started bool
@@ -248,8 +278,10 @@ func NewNode(cfg Config) (*RaftNode, error) {
 		// Sentinel entry; see the log field comment.
 		log: []LogEntry{{Term: 0, Index: 0}},
 
-		stopCh: make(chan struct{}),
+		triggerCh: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
 	}
+	rn.applyCond = sync.NewCond(&rn.mu)
 
 	hs, found, err := cfg.Store.LoadHardState()
 	if err != nil {
@@ -277,9 +309,23 @@ func (rn *RaftNode) Start() error {
 	}
 	rn.started = true
 	rn.resetElectionTimerLocked()
-	rn.wg.Add(1)
+	rn.wg.Add(2)
 	go rn.runElectionTicker()
+	go rn.runApplier()
 	return nil
+}
+
+// SetStateMachine wires the consumer of committed entries. Must be called
+// before Start (it exists as a setter, rather than a Config field, only to
+// break the chicken-and-egg between constructing the KV server — which
+// needs the node — and the node — which needs the state machine).
+func (rn *RaftNode) SetStateMachine(sm StateMachine) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	if rn.started {
+		panic("raft: SetStateMachine after Start")
+	}
+	rn.stateMachine = sm
 }
 
 // Stop shuts down the node's goroutines. In-flight RPCs are not waited for;
@@ -292,9 +338,40 @@ func (rn *RaftNode) Stop() {
 		return
 	}
 	rn.stopped = true
+	rn.applyCond.Broadcast() // wake the applier so it can observe stopped
 	rn.mu.Unlock()
 	close(rn.stopCh)
 	rn.wg.Wait()
+}
+
+// Propose asks the leader to replicate a state-machine command. It returns
+// the log index and term the command was appended at — the command is
+// committed once (and only if) that exact (index, term) pair gets applied;
+// if a different term shows up at that index, leadership changed and the
+// command was lost (the caller may safely retry against the new leader).
+//
+// Propose returns before the entry is committed. Callers who need to know
+// the outcome (the KV server does) watch Apply for the (index, term) pair.
+func (rn *RaftNode) Propose(command []byte) (index, term uint64, err error) {
+	rn.mu.Lock()
+	if rn.state != Leader {
+		rn.mu.Unlock()
+		return 0, 0, ErrNotLeader
+	}
+	index = rn.lastLogIndex() + 1
+	term = rn.currentTerm
+	rn.log = append(rn.log, LogEntry{Term: term, Index: index, Command: command})
+	// The log itself is in-memory until Phase 4's WAL — a crash here loses
+	// the entry, which is fine: it was never acknowledged to anyone.
+	rn.advanceCommitIndexLocked() // single-node cluster commits immediately
+	rn.mu.Unlock()
+
+	// Kick replication now instead of waiting out the heartbeat tick.
+	select {
+	case rn.triggerCh <- struct{}{}:
+	default: // a kick is already pending; one round covers both
+	}
+	return index, term, nil
 }
 
 // ID returns this node's ID.
@@ -384,6 +461,42 @@ func (rn *RaftNode) lastLogIndex() uint64 {
 // Callers must hold rn.mu.
 func (rn *RaftNode) lastLogTerm() uint64 {
 	return rn.log[len(rn.log)-1].Term
+}
+
+// termAt returns the term of the log entry at the given index (0 at the
+// sentinel index 0). While the log is never compacted, a log index IS the
+// slice position (the sentinel keeps them aligned); Phase 5's snapshotting
+// will change that mapping, and centralizing the arithmetic here (and in
+// entriesFrom/truncateFrom) means it changes in one place.
+//
+// Callers must hold rn.mu and ensure index <= lastLogIndex().
+func (rn *RaftNode) termAt(index uint64) uint64 {
+	return rn.log[index].Term
+}
+
+// entriesFrom returns a copy of all entries with index >= from. It must
+// copy: the caller sends the result outside the lock, and the underlying
+// array would otherwise be shared with a log that later gets truncated and
+// re-appended (a data race, and worse, silently mutating in-flight RPCs).
+//
+// Callers must hold rn.mu and ensure from <= lastLogIndex()+1.
+func (rn *RaftNode) entriesFrom(from uint64) []LogEntry {
+	tail := rn.log[from:]
+	if len(tail) == 0 {
+		return nil
+	}
+	out := make([]LogEntry, len(tail))
+	copy(out, tail)
+	return out
+}
+
+// truncateFrom drops every entry with index >= from (from must be >= 1; the
+// sentinel is never dropped). Only ever called on conflicting, uncommitted
+// suffixes — see HandleAppendEntries for the guard rails.
+//
+// Callers must hold rn.mu.
+func (rn *RaftNode) truncateFrom(from uint64) {
+	rn.log = rn.log[:from]
 }
 
 // quorum returns the majority size for the full cluster (peers + self).
