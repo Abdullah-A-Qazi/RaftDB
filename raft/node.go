@@ -2,13 +2,17 @@
 // consensus algorithm (Ongaro & Ousterhout, "In Search of an Understandable
 // Consensus Algorithm").
 //
-// Phase 0 defines only the state from the paper's Figure 2; behavior
-// (elections, replication) arrives in later phases.
+// Phase 1 implements leader election (§5.2): state transitions, randomized
+// election timeouts, heartbeats, and durable currentTerm/votedFor. Log
+// replication arrives in Phase 2, the safety rules in Phase 3.
 package raft
 
 import (
 	"fmt"
+	"log/slog"
+	"math/rand/v2"
 	"sync"
+	"time"
 )
 
 // State is the role a node is currently playing (§5.1). Every node starts as
@@ -35,15 +39,15 @@ func (s State) String() string {
 	}
 }
 
-// None is the zero value for votedFor, standing in for the paper's "null":
-// this node has not voted for anyone in the current term. It works as a
-// sentinel because config validation rejects empty node IDs.
+// None is the zero value for votedFor and leaderID, standing in for the
+// paper's "null": no vote cast / no known leader. It works as a sentinel
+// because config validation rejects empty node IDs.
 const None = ""
 
 // LogEntry is one entry in the replicated log. This is a domain type,
 // deliberately separate from the protobuf LogEntry: the core algorithm
 // shouldn't be coupled to the wire encoding, and conversion happens at the
-// RPC boundary (Phase 1+).
+// RPC boundary.
 type LogEntry struct {
 	// Term when the entry was created on the leader. Terms are how Raft
 	// detects that two logs have diverged (Log Matching Property, §5.3).
@@ -59,6 +63,62 @@ type LogEntry struct {
 	Command []byte
 }
 
+// Config carries everything a RaftNode needs at construction time.
+type Config struct {
+	// ID is this node's ID from the cluster config; Peers is every other
+	// member. Quorum size is derived from len(Peers)+1, so all nodes must
+	// agree on membership (enforced by sharing one config file).
+	ID    string
+	Peers []string
+
+	// Store persists HardState. Required.
+	Store StateStore
+
+	// Transport sends RPCs to peers. Required by Start; may be nil for
+	// tests that only poke the RPC handlers.
+	Transport Transport
+
+	// ElectionTimeoutMin/Max bound the randomized election timeout
+	// (defaults 150–300ms, the paper's suggested range §5.6).
+	// Randomization is load-bearing, not cosmetic: if all nodes timed out
+	// identically, every split vote would repeat forever — spreading the
+	// timeouts makes one node usually time out first, win, and heartbeat
+	// the others down (§5.2).
+	ElectionTimeoutMin time.Duration
+	ElectionTimeoutMax time.Duration
+
+	// HeartbeatInterval is how often a leader sends empty AppendEntries
+	// (default 50ms). Must be well under ElectionTimeoutMin or followers
+	// will start elections against a healthy leader.
+	HeartbeatInterval time.Duration
+
+	// RPCTimeout bounds each outgoing RPC (default 100ms). A dead peer
+	// must not be able to wedge an election round.
+	RPCTimeout time.Duration
+
+	Logger *slog.Logger
+}
+
+func (c *Config) withDefaults() Config {
+	out := *c
+	if out.ElectionTimeoutMin == 0 {
+		out.ElectionTimeoutMin = 150 * time.Millisecond
+	}
+	if out.ElectionTimeoutMax == 0 {
+		out.ElectionTimeoutMax = 300 * time.Millisecond
+	}
+	if out.HeartbeatInterval == 0 {
+		out.HeartbeatInterval = 50 * time.Millisecond
+	}
+	if out.RPCTimeout == 0 {
+		out.RPCTimeout = 100 * time.Millisecond
+	}
+	if out.Logger == nil {
+		out.Logger = slog.Default()
+	}
+	return out
+}
+
 // RaftNode holds all Raft state for one member of the cluster, mirroring the
 // paper's Figure 2 "State" box field-for-field.
 type RaftNode struct {
@@ -67,22 +127,22 @@ type RaftNode struct {
 	// (e.g. granting a vote reads currentTerm and the log, then writes
 	// votedFor), and finer-grained locking is where subtle races breed.
 	// Performance is explicitly not a goal yet.
+	//
+	// Invariant: no code calls cfg.Transport while holding mu (see the
+	// Transport doc comment for why).
 	mu sync.Mutex
 
-	// id is this node's own ID from the cluster config.
-	id string
+	cfg    Config
+	logger *slog.Logger
 
-	// peers is the IDs of every other cluster member. Static for now
-	// (no membership changes, §6 is future work).
+	// id is this node's own ID; peers is everyone else.
+	id    string
 	peers []string
 
 	// ---------------------------------------------------------------
-	// Persistent state on all servers (Figure 2). These MUST be flushed
-	// to stable storage before responding to any RPC — otherwise a node
-	// could vote for candidate A, crash, restart with votedFor erased,
-	// and vote for candidate B in the same term, electing two leaders.
-	// Actual persistence is wired in Phase 1; the fields live here so
-	// the shape is right from the start.
+	// Persistent state on all servers (Figure 2). Flushed to disk via
+	// persistLocked() before any RPC response or request that depends
+	// on them leaves this node.
 	// ---------------------------------------------------------------
 
 	// currentTerm is the latest term this node has seen. Starts at 0,
@@ -100,6 +160,7 @@ type RaftNode struct {
 	// commitIndex, "last log index") identical to Figure 2 with no
 	// off-by-one translation. The sentinel is also what prevLogIndex=0
 	// matches against when appending the very first entry.
+	// (In-memory only until Phase 4's WAL; empty in Phase 1 anyway.)
 	log []LogEntry
 
 	// ---------------------------------------------------------------
@@ -113,8 +174,7 @@ type RaftNode struct {
 	commitIndex uint64
 
 	// lastApplied is the highest log index actually fed to the state
-	// machine. Always <= commitIndex; the gap is entries committed but
-	// not yet applied.
+	// machine. Always <= commitIndex.
 	lastApplied uint64
 
 	// ---------------------------------------------------------------
@@ -123,50 +183,190 @@ type RaftNode struct {
 	// ---------------------------------------------------------------
 
 	// nextIndex is, per follower, the index of the next log entry to
-	// send. Initialized optimistically to leader's last index + 1 and
-	// decremented on AppendEntries rejections until logs match.
+	// send. Initialized optimistically to leader's last index + 1.
 	nextIndex map[string]uint64
 
 	// matchIndex is, per follower, the highest index known to be
-	// replicated there. Initialized pessimistically to 0 (we know
-	// nothing until a follower confirms). The leader advances
-	// commitIndex by finding the highest N replicated on a majority of
-	// matchIndex values — subject to the current-term rule (Phase 3).
+	// replicated there. Initialized pessimistically to 0.
 	matchIndex map[string]uint64
 
-	// state is this node's current role. Volatile: a restarted node
-	// always comes back as a follower.
+	// ---------------------------------------------------------------
+	// Election machinery (volatile).
+	// ---------------------------------------------------------------
+
+	// state is this node's current role. A restarted node always comes
+	// back as a follower (§5.1).
 	state State
+
+	// leaderID is the last known leader of currentTerm (learned from
+	// AppendEntries), used for client redirection in Phase 2.
+	leaderID string
+
+	// electionResetAt is when the election timer last restarted, and
+	// electionTimeout is the current randomized duration; the ticker
+	// goroutine starts an election when now - electionResetAt exceeds
+	// electionTimeout while not leader.
+	electionResetAt time.Time
+	electionTimeout time.Duration
+
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
+	started bool
+	stopped bool
 }
 
-// NewNode creates a RaftNode with the initial state Figure 2 prescribes for
-// a server that has never run before: term 0, no vote cast, empty log,
-// nothing committed or applied, follower role.
-func NewNode(id string, peers []string) *RaftNode {
-	return &RaftNode{
-		id:    id,
-		peers: peers,
-		state: Follower,
+// NewNode creates a RaftNode. A fresh node gets the initial state Figure 2
+// prescribes (term 0, no vote, empty log, follower); a node with prior
+// durable state recovers currentTerm and votedFor from its store — that
+// recovery is what makes "restart and vote again in the same term"
+// impossible.
+func NewNode(cfg Config) (*RaftNode, error) {
+	if cfg.ID == "" {
+		return nil, fmt.Errorf("raft: config.ID is required")
+	}
+	if cfg.Store == nil {
+		return nil, fmt.Errorf("raft: config.Store is required")
+	}
+	cfg = cfg.withDefaults()
+	if cfg.ElectionTimeoutMin > cfg.ElectionTimeoutMax {
+		return nil, fmt.Errorf("raft: ElectionTimeoutMin > ElectionTimeoutMax")
+	}
+	if cfg.HeartbeatInterval >= cfg.ElectionTimeoutMin {
+		return nil, fmt.Errorf("raft: HeartbeatInterval (%v) must be well below ElectionTimeoutMin (%v)",
+			cfg.HeartbeatInterval, cfg.ElectionTimeoutMin)
+	}
+
+	rn := &RaftNode{
+		cfg:    cfg,
+		logger: cfg.Logger.With("node", cfg.ID),
+		id:     cfg.ID,
+		peers:  cfg.Peers,
+		state:  Follower,
 
 		currentTerm: 0,
 		votedFor:    None,
 		// Sentinel entry; see the log field comment.
 		log: []LogEntry{{Term: 0, Index: 0}},
 
-		commitIndex: 0,
-		lastApplied: 0,
-
-		// Leader-only maps are allocated lazily on election win
-		// (Phase 1); leaving them nil here makes accidental use
-		// while not leader loud in tests.
-		nextIndex:  nil,
-		matchIndex: nil,
+		stopCh: make(chan struct{}),
 	}
+
+	hs, found, err := cfg.Store.LoadHardState()
+	if err != nil {
+		return nil, fmt.Errorf("raft: loading hard state: %w", err)
+	}
+	if found {
+		rn.currentTerm = hs.CurrentTerm
+		rn.votedFor = hs.VotedFor
+		rn.logger.Info("recovered hard state", "term", rn.currentTerm, "votedFor", rn.votedFor)
+	}
+	return rn, nil
+}
+
+// Start launches the election timer. The node begins as a follower and will
+// start an election if it hears from no leader within its (randomized)
+// election timeout.
+func (rn *RaftNode) Start() error {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	if rn.cfg.Transport == nil {
+		return fmt.Errorf("raft: config.Transport is required to Start")
+	}
+	if rn.started {
+		return fmt.Errorf("raft: already started")
+	}
+	rn.started = true
+	rn.resetElectionTimerLocked()
+	rn.wg.Add(1)
+	go rn.runElectionTicker()
+	return nil
+}
+
+// Stop shuts down the node's goroutines. In-flight RPCs are not waited for;
+// their late replies land on this (now inert) instance and are discarded by
+// the term/state guards.
+func (rn *RaftNode) Stop() {
+	rn.mu.Lock()
+	if rn.stopped {
+		rn.mu.Unlock()
+		return
+	}
+	rn.stopped = true
+	rn.mu.Unlock()
+	close(rn.stopCh)
+	rn.wg.Wait()
 }
 
 // ID returns this node's ID.
 func (rn *RaftNode) ID() string {
 	return rn.id
+}
+
+// persistLocked writes HardState durably. It MUST be called after any
+// mutation of currentTerm/votedFor and before the lock is released — i.e.
+// before any RPC reply or request reflecting the new state can leave this
+// node. Callers must hold rn.mu.
+//
+// A store failure panics: Raft's model is fail-stop. A node whose disk
+// cannot record its vote must crash rather than keep answering RPCs it will
+// not remember after a restart (that amnesia is how a term gets two
+// leaders).
+func (rn *RaftNode) persistLocked() {
+	err := rn.cfg.Store.SaveHardState(HardState{
+		CurrentTerm: rn.currentTerm,
+		VotedFor:    rn.votedFor,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("raft %s: persisting hard state: %v", rn.id, err))
+	}
+}
+
+// resetElectionTimerLocked restarts the election countdown with a fresh
+// random duration. Per Figure 2 this happens when (a) we accept an
+// AppendEntries from the current leader, (b) we grant a vote, or (c) we
+// start an election ourselves. Notably it does NOT happen when we merely
+// receive (and deny) some candidate's RequestVote — a candidate that cannot
+// win must not be able to indefinitely postpone our own candidacy.
+//
+// Callers must hold rn.mu.
+func (rn *RaftNode) resetElectionTimerLocked() {
+	rn.electionResetAt = time.Now()
+	spread := rn.cfg.ElectionTimeoutMax - rn.cfg.ElectionTimeoutMin
+	rn.electionTimeout = rn.cfg.ElectionTimeoutMin
+	if spread > 0 {
+		rn.electionTimeout += rand.N(spread)
+	}
+}
+
+// becomeFollowerLocked steps down into the follower role because we saw
+// evidence of term `term` (>= currentTerm).
+//
+// votedFor is cleared ONLY when the term actually advances. A candidate
+// stepping down within the same term (because a leader for that term
+// appeared) must keep its self-vote: clearing it would let this node vote a
+// second time in the same term, and two votes from one node is how two
+// leaders get elected for one term.
+//
+// The election timer is reset only on a term change — entering a new term
+// is fresh evidence of an active election/leader, and it prevents a
+// stampede of ex-leaders/candidates whose stale timers would otherwise fire
+// instantly. (Strictly, Figure 2 resets only on heartbeat/vote-grant; this
+// is a mild, widely used deviation — flagged in docs/phase-1.)
+//
+// Callers must hold rn.mu and must persist before releasing it if the term
+// changed (this function persists, so that holds automatically).
+func (rn *RaftNode) becomeFollowerLocked(term uint64) {
+	if term > rn.currentTerm {
+		rn.logger.Info("entering new term as follower", "term", term, "prevTerm", rn.currentTerm)
+		rn.currentTerm = term
+		rn.votedFor = None
+		rn.leaderID = None
+		rn.persistLocked()
+		rn.resetElectionTimerLocked()
+	} else if rn.state != Follower {
+		rn.logger.Info("stepping down to follower", "term", rn.currentTerm)
+	}
+	rn.state = Follower
 }
 
 // lastLogIndex returns the index of the last entry in the log. The sentinel
@@ -186,15 +386,21 @@ func (rn *RaftNode) lastLogTerm() uint64 {
 	return rn.log[len(rn.log)-1].Term
 }
 
+// quorum returns the majority size for the full cluster (peers + self).
+func (rn *RaftNode) quorum() int {
+	return (len(rn.peers)+1)/2 + 1
+}
+
 // Status is a read-only snapshot of a node's externally observable state,
 // for tests, logging, and (in Phase 7) the dashboard.
 type Status struct {
-	ID          string
-	State       State
-	CurrentTerm uint64
-	VotedFor    string
-	CommitIndex uint64
-	LastApplied uint64
+	ID           string
+	State        State
+	CurrentTerm  uint64
+	VotedFor     string
+	LeaderID     string
+	CommitIndex  uint64
+	LastApplied  uint64
 	LastLogIndex uint64
 	LastLogTerm  uint64
 }
@@ -208,6 +414,7 @@ func (rn *RaftNode) Status() Status {
 		State:        rn.state,
 		CurrentTerm:  rn.currentTerm,
 		VotedFor:     rn.votedFor,
+		LeaderID:     rn.leaderID,
 		CommitIndex:  rn.commitIndex,
 		LastApplied:  rn.lastApplied,
 		LastLogIndex: rn.lastLogIndex(),
