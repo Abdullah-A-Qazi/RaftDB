@@ -1,46 +1,120 @@
-// Package storage will hold the persistence layer for Raft's durable state.
+// Package storage holds the persistence layer for Raft's durable state.
 //
-// Phase 0 defines only the contract; implementations arrive later:
-//   - Phase 1: a simple file-based store for the hard state (currentTerm,
-//     votedFor), synced before any RPC response.
-//   - Phase 4: a real append-only write-ahead log for entries, with fsync
-//     before acking and a crash-recovery path.
-//   - Phase 5: snapshot files and log truncation.
+// Phase 1 implements FileStore for the hard state (currentTerm, votedFor).
+// The log's append-only write-ahead log arrives in Phase 4, and snapshot
+// files in Phase 5 — the log stays in memory until then.
+//
+// (Phase 0 sketched one wide Store interface here; it was split so that the
+// interface raft depends on — raft.StateStore — lives in package raft. That
+// keeps the dependency arrow pointing one way: storage imports raft's
+// types, raft never imports storage.)
 package storage
 
-import "github.com/Abdullah-A-Qazi/RaftDB/raft"
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 
-// HardState is the state Figure 2 marks as persistent (minus the log, which
-// gets its own methods because it is append-heavy and will be stored
-// differently). It must be on disk before the node answers any RPC that
-// depends on it — see the persistence comments in package raft.
-type HardState struct {
-	CurrentTerm uint64
-	VotedFor    string
+	"github.com/Abdullah-A-Qazi/RaftDB/raft"
+)
+
+// FileStore persists HardState as a single small JSON file, replaced
+// atomically on every save. This is deliberately NOT a WAL (deviation from
+// the phase plan's "simple file-based WAL is fine"): the hard state is two
+// fields that get overwritten, not appended to, so write-temp + fsync +
+// rename is both simpler and fully crash-safe. The append-shaped data — the
+// log — gets a real WAL in Phase 4.
+type FileStore struct {
+	dir  string
+	path string
 }
 
-// Store is the durability contract the Raft node will program against.
-// Every method that mutates state must not return until the change is
-// durable (fsync'd), because Raft's correctness proofs assume a node that
-// answered an RPC remembers what it answered — even across kill -9.
-type Store interface {
-	// SaveHardState atomically persists term and vote.
-	SaveHardState(hs HardState) error
+const hardStateFile = "hardstate.json"
 
-	// LoadHardState returns the persisted hard state, or a zero
-	// HardState and found=false on a fresh node.
-	LoadHardState() (hs HardState, found bool, err error)
+// NewFileStore creates (if needed) dir and returns a store rooted there.
+// Each node must use its own directory.
+func NewFileStore(dir string) (*FileStore, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("storage: creating %s: %w", dir, err)
+	}
+	return &FileStore{dir: dir, path: filepath.Join(dir, hardStateFile)}, nil
+}
 
-	// AppendEntries durably appends entries to the log.
-	AppendEntries(entries []raft.LogEntry) error
+// SaveHardState durably replaces the stored hard state. The sequence is:
+//
+//	write to a temp file → fsync it → rename over the real file → fsync dir
+//
+// Why each step matters:
+//   - temp file + rename: a crash mid-write must never leave a torn,
+//     half-JSON state file. rename(2) is atomic on POSIX filesystems, so a
+//     reader sees either the complete old state or the complete new one.
+//   - fsync before rename: otherwise the rename can hit disk before the
+//     file's *contents* do, and a power cut leaves the new name pointing at
+//     garbage.
+//   - fsync the directory: the rename itself is a directory mutation; until
+//     the directory is synced, a crash can silently undo it.
+//
+// Only after all of that may the caller answer an RPC — a vote that isn't
+// on disk is a vote we could repeat after a restart.
+func (s *FileStore) SaveHardState(hs raft.HardState) error {
+	data, err := json.Marshal(hs)
+	if err != nil {
+		return fmt.Errorf("storage: encoding hard state: %w", err)
+	}
 
-	// TruncateSuffix durably removes all entries with index >= from.
-	// Needed when a follower's log conflicts with the leader's and the
-	// divergent tail must be discarded (§5.3).
-	TruncateSuffix(from uint64) error
+	tmp, err := os.CreateTemp(s.dir, hardStateFile+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("storage: creating temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup on any failure path below.
+	defer os.Remove(tmpName)
 
-	// LoadEntries returns all persisted log entries in index order.
-	LoadEntries() ([]raft.LogEntry, error)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("storage: writing hard state: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("storage: syncing hard state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("storage: closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return fmt.Errorf("storage: replacing hard state: %w", err)
+	}
+	if err := syncDir(s.dir); err != nil {
+		return fmt.Errorf("storage: syncing dir: %w", err)
+	}
+	return nil
+}
 
-	Close() error
+// LoadHardState reads the persisted hard state; found is false on a node
+// that has never saved (a fresh cluster member).
+func (s *FileStore) LoadHardState() (raft.HardState, bool, error) {
+	data, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		return raft.HardState{}, false, nil
+	}
+	if err != nil {
+		return raft.HardState{}, false, fmt.Errorf("storage: reading hard state: %w", err)
+	}
+	var hs raft.HardState
+	if err := json.Unmarshal(data, &hs); err != nil {
+		// A torn file here would mean the atomic-rename invariant was
+		// violated (or the file was hand-edited); refuse to guess.
+		return raft.HardState{}, false, fmt.Errorf("storage: corrupt hard state %s: %w", s.path, err)
+	}
+	return hs, true, nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
