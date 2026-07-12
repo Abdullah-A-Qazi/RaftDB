@@ -1,0 +1,9 @@
+{
+  "nodes": [
+    {"id": "node1", "raft_addr": "127.0.0.1:9001", "client_addr": "127.0.0.1:8001"},
+    {"id": "node2", "raft_addr": "127.0.0.1:9002", "client_addr": "127.0.0.1:8002"},
+    {"id": "node3", "raft_addr": "127.0.0.1:9003", "client_addr": "127.0.0.1:8003"},
+    {"id": "node4", "raft_addr": "127.0.0.1:9004", "client_addr": "127.0.0.1:8004"},
+    {"id": "node5", "raft_addr": "127.0.0.1:9005", "client_addr": "127.0.0.1:8005"}
+  ]
+}
