@@ -71,7 +71,12 @@ func (t *Transport) AppendEntries(ctx context.Context, peerID string, args raft.
 	if err != nil {
 		return raft.AppendEntriesReply{}, err
 	}
-	return raft.AppendEntriesReply{Term: resp.Term, Success: resp.Success}, nil
+	return raft.AppendEntriesReply{
+		Term:          resp.Term,
+		Success:       resp.Success,
+		ConflictIndex: resp.ConflictIndex,
+		ConflictTerm:  resp.ConflictTerm,
+	}, nil
 }
 
 // Close tears down all peer connections.

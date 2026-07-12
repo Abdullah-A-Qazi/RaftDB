@@ -47,8 +47,10 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReq
 		LeaderCommit: req.LeaderCommit,
 	})
 	return &raftpb.AppendEntriesResponse{
-		Term:    reply.Term,
-		Success: reply.Success,
+		Term:          reply.Term,
+		Success:       reply.Success,
+		ConflictIndex: reply.ConflictIndex,
+		ConflictTerm:  reply.ConflictTerm,
 	}, nil
 }
 

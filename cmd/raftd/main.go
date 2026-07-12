@@ -1,7 +1,7 @@
 // raftd is the RaftDB server daemon: one process per cluster node.
 //
-// Phase 1: serves Raft RPCs on raft_addr and participates in leader
-// election. The client-facing KV API (on client_addr) arrives in Phase 2.
+// It serves two listeners: Raft RPCs to peers on raft_addr, and the
+// client-facing KV API on client_addr (with leader redirection).
 package main
 
 import (
@@ -17,8 +17,10 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/Abdullah-A-Qazi/RaftDB/config"
+	"github.com/Abdullah-A-Qazi/RaftDB/kv"
 	"github.com/Abdullah-A-Qazi/RaftDB/raft"
 	"github.com/Abdullah-A-Qazi/RaftDB/rpc"
+	"github.com/Abdullah-A-Qazi/RaftDB/rpc/kvpb"
 	"github.com/Abdullah-A-Qazi/RaftDB/rpc/raftpb"
 	"github.com/Abdullah-A-Qazi/RaftDB/storage"
 )
@@ -75,19 +77,41 @@ func main() {
 		log.Fatalf("raftd: %v", err)
 	}
 
-	lis, err := net.Listen("tcp", self.RaftAddr)
+	// KV layer: client_addr map for redirects, state machine wired in
+	// before Start.
+	clientAddrs := make(map[string]string, len(cluster.Nodes))
+	for _, n := range cluster.Nodes {
+		clientAddrs[n.ID] = n.ClientAddr
+	}
+	kvStore := kv.NewStore()
+	kvServer := kv.NewServer(node, kvStore, clientAddrs, logger)
+	node.SetStateMachine(kvServer)
+
+	raftLis, err := net.Listen("tcp", self.RaftAddr)
 	if err != nil {
 		log.Fatalf("raftd: listening on %s: %v", self.RaftAddr, err)
 	}
-	grpcServer := grpc.NewServer()
-	raftpb.RegisterRaftServer(grpcServer, rpc.NewServer(node))
+	raftSrv := grpc.NewServer()
+	raftpb.RegisterRaftServer(raftSrv, rpc.NewServer(node))
+
+	clientLis, err := net.Listen("tcp", self.ClientAddr)
+	if err != nil {
+		log.Fatalf("raftd: listening on %s: %v", self.ClientAddr, err)
+	}
+	clientSrv := grpc.NewServer()
+	kvpb.RegisterKVServer(clientSrv, kvServer)
 
 	// Serve RPCs before starting the election timer so a peer's very first
 	// RequestVote can't hit a not-yet-listening socket after we ourselves
 	// have already begun counting down.
 	go func() {
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("raftd: grpc serve: %v", err)
+		if err := raftSrv.Serve(raftLis); err != nil {
+			log.Fatalf("raftd: raft serve: %v", err)
+		}
+	}()
+	go func() {
+		if err := clientSrv.Serve(clientLis); err != nil {
+			log.Fatalf("raftd: kv serve: %v", err)
 		}
 	}()
 	if err := node.Start(); err != nil {
@@ -96,6 +120,7 @@ func main() {
 	logger.Info("raftd started",
 		"node", self.ID,
 		"raftAddr", self.RaftAddr,
+		"clientAddr", self.ClientAddr,
 		"clusterSize", len(cluster.Nodes),
 		"quorum", cluster.QuorumSize(),
 	)
@@ -106,5 +131,6 @@ func main() {
 
 	logger.Info("shutting down")
 	node.Stop()
-	grpcServer.GracefulStop()
+	clientSrv.GracefulStop()
+	raftSrv.GracefulStop()
 }

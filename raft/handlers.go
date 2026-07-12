@@ -82,10 +82,67 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 	// timeout waits for.
 	rn.resetElectionTimerLocked()
 
-	// PHASE 2 will add here, in order: the log consistency check on
-	// PrevLogIndex/PrevLogTerm (reply false + conflict hints on mismatch),
-	// truncation of conflicting suffixes, appending of new entries, and
-	// advancing commitIndex to min(LeaderCommit, last new index).
+	// --- Log consistency check (§5.3) ---
+	// We may only accept these entries if our log matches the leader's at
+	// the position just before them. This inductive check is what upholds
+	// the Log Matching Property: if two logs agree on (index, term) at one
+	// position, they agree on everything before it.
+	if args.PrevLogIndex > rn.lastLogIndex() {
+		// Our log is too short to even contain the predecessor. Hint the
+		// leader to jump straight to our end instead of probing backwards
+		// one index per round trip.
+		reply.ConflictTerm = 0
+		reply.ConflictIndex = rn.lastLogIndex() + 1
+		return reply
+	}
+	if have := rn.termAt(args.PrevLogIndex); have != args.PrevLogTerm {
+		// We have an entry there, but from the wrong term. Hint: the term
+		// we do have, and our first index of that term — the leader can
+		// step over the whole run of bad-term entries at once.
+		reply.ConflictTerm = have
+		first := args.PrevLogIndex
+		for first > 1 && rn.termAt(first-1) == have {
+			first--
+		}
+		reply.ConflictIndex = first
+		return reply
+	}
+
+	// --- Append (§5.3, Figure 2 receiver steps 3–4) ---
+	// Walk the incoming entries; skip everything we already have. We must
+	// NOT blindly truncate at PrevLogIndex+1: RPCs can arrive duplicated or
+	// out of order, and a stale AppendEntries that only covers an old
+	// prefix would otherwise chop off newer entries we already acknowledged
+	// — including committed ones. Truncation is allowed only on a genuine
+	// term conflict at some index.
+	for i, e := range args.Entries {
+		if e.Index <= rn.lastLogIndex() {
+			if rn.termAt(e.Index) == e.Term {
+				continue // already have this exact entry
+			}
+			// Conflict: our suffix from e.Index on was written by a
+			// different (deposed) leader and can never commit — Raft
+			// guarantees no committed entry ever conflicts with a current
+			// leader's log, so everything we drop here was uncommitted.
+			rn.truncateFrom(e.Index)
+		}
+		rn.log = append(rn.log, args.Entries[i:]...)
+		break
+	}
+
+	// --- Advance commitIndex (Figure 2 receiver step 5) ---
+	// min(leaderCommit, last new entry): leaderCommit may point past the
+	// entries this particular request verified; we may only trust our log
+	// up to what we just matched against the leader, not beyond.
+	if args.LeaderCommit > rn.commitIndex {
+		lastNew := args.PrevLogIndex + uint64(len(args.Entries))
+		newCommit := min(args.LeaderCommit, lastNew)
+		if newCommit > rn.commitIndex {
+			rn.commitIndex = newCommit
+			rn.applyCond.Signal()
+		}
+	}
+
 	reply.Success = true
 	return reply
 }
