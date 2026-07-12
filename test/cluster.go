@@ -14,7 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Abdullah-A-Qazi/RaftDB/kv"
 	"github.com/Abdullah-A-Qazi/RaftDB/raft"
+	"github.com/Abdullah-A-Qazi/RaftDB/rpc/kvpb"
 	"github.com/Abdullah-A-Qazi/RaftDB/storage"
 )
 
@@ -37,7 +39,42 @@ type Cluster struct {
 	nodes     map[string]*raft.RaftNode // nil entry = not running
 	dirs      map[string]string         // per-node durable state, survives restarts
 	connected map[string]bool
+
+	// KV layer, one per running node. Rebuilt from scratch on restart —
+	// the log replay through normal replication is what repopulates it.
+	stores    map[string]*kv.Store
+	kvs       map[string]*kv.Server
+	recorders map[string]*applyRecorder
 }
+
+// applyRecorder wraps a node's state machine to record the order entries
+// were applied in, so tests can assert every node saw the same sequence.
+type applyRecorder struct {
+	inner raft.StateMachine
+
+	mu      sync.Mutex
+	indexes []uint64
+}
+
+func (r *applyRecorder) Apply(e raft.LogEntry) {
+	r.mu.Lock()
+	r.indexes = append(r.indexes, e.Index)
+	r.mu.Unlock()
+	r.inner.Apply(e)
+}
+
+func (r *applyRecorder) applied() []uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]uint64, len(r.indexes))
+	copy(out, r.indexes)
+	return out
+}
+
+// clientAddr fabricates the client address a node would advertise; the
+// in-process harness has no real listeners, so tests only assert the
+// redirect *routing* (ID + address string), not a network hop.
+func clientAddr(id string) string { return "client-addr-" + id }
 
 // NewCluster starts n nodes (node1..nodeN) with real FileStore persistence
 // in per-node temp dirs, so Restart genuinely recovers from disk.
@@ -48,6 +85,9 @@ func NewCluster(t *testing.T, n int) *Cluster {
 		nodes:     make(map[string]*raft.RaftNode, n),
 		dirs:      make(map[string]string, n),
 		connected: make(map[string]bool, n),
+		stores:    make(map[string]*kv.Store, n),
+		kvs:       make(map[string]*kv.Server, n),
+		recorders: make(map[string]*applyRecorder, n),
 	}
 	for i := 1; i <= n; i++ {
 		id := fmt.Sprintf("node%d", i)
@@ -88,12 +128,125 @@ func (c *Cluster) startNode(id string) {
 	if err != nil {
 		c.t.Fatalf("startNode(%s): %v", id, err)
 	}
+
+	// KV layer for this incarnation. Fresh and empty: everything it will
+	// contain arrives by replaying the replicated log.
+	clientAddrs := make(map[string]string, len(c.ids))
+	for _, other := range c.ids {
+		clientAddrs[other] = clientAddr(other)
+	}
+	kvStore := kv.NewStore()
+	server := kv.NewServer(node, kvStore, clientAddrs, clusterLogger())
+	recorder := &applyRecorder{inner: server}
+	node.SetStateMachine(recorder)
+
 	c.mu.Lock()
 	c.nodes[id] = node
+	c.stores[id] = kvStore
+	c.kvs[id] = server
+	c.recorders[id] = recorder
 	c.mu.Unlock()
 	if err := node.Start(); err != nil {
 		c.t.Fatalf("startNode(%s): %v", id, err)
 	}
+}
+
+// KV returns a node's client-facing server (callable directly — gRPC
+// methods are plain methods).
+func (c *Cluster) KV(id string) *kv.Server {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.kvs[id]
+}
+
+// Store returns a node's state machine for direct inspection.
+func (c *Cluster) Store(id string) *kv.Store {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stores[id]
+}
+
+// Applied returns the order of indexes a node has applied (this
+// incarnation).
+func (c *Cluster) Applied(id string) []uint64 {
+	c.mu.Lock()
+	r := c.recorders[id]
+	c.mu.Unlock()
+	return r.applied()
+}
+
+// MustPut writes through the current leader, retrying across leadership
+// changes until it succeeds or the deadline passes.
+func (c *Cluster) MustPut(key, value string) {
+	c.t.Helper()
+	c.mustWrite("Put "+key, func(ctx context.Context, srv *kv.Server) (*kvpb.Redirect, error) {
+		resp, err := srv.Put(ctx, &kvpb.PutRequest{Key: key, Value: value})
+		if err != nil {
+			return nil, err
+		}
+		return resp.Redirect, nil
+	})
+}
+
+// MustDelete deletes through the current leader, with the same retry rules.
+func (c *Cluster) MustDelete(key string) {
+	c.t.Helper()
+	c.mustWrite("Delete "+key, func(ctx context.Context, srv *kv.Server) (*kvpb.Redirect, error) {
+		resp, err := srv.Delete(ctx, &kvpb.DeleteRequest{Key: key})
+		if err != nil {
+			return nil, err
+		}
+		return resp.Redirect, nil
+	})
+}
+
+func (c *Cluster) mustWrite(desc string, op func(context.Context, *kv.Server) (*kvpb.Redirect, error)) {
+	c.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, srv := c.pickLeaderKV()
+		if srv == nil {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		redirect, err := op(ctx, srv)
+		cancel()
+		if err == nil && redirect == nil {
+			return // committed and applied
+		}
+		time.Sleep(20 * time.Millisecond) // leadership churn; retry
+	}
+	c.t.Fatalf("%s: no successful write within deadline", desc)
+}
+
+// GetFromLeader reads a key from the current leader's KV server.
+func (c *Cluster) GetFromLeader(key string) (string, bool) {
+	c.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, srv := c.pickLeaderKV()
+		if srv != nil {
+			resp, err := srv.Get(context.Background(), &kvpb.GetRequest{Key: key})
+			if err == nil && resp.Redirect == nil {
+				return resp.Value, resp.Found
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Fatalf("Get %s: no leader served the read within deadline", key)
+	return "", false
+}
+
+// pickLeaderKV returns the KV server of the node currently believing it is
+// leader (among running, connected nodes), or nil.
+func (c *Cluster) pickLeaderKV() (string, *kv.Server) {
+	for id, s := range c.Statuses() {
+		if s.State == raft.Leader {
+			return id, c.KV(id)
+		}
+	}
+	return "", nil
 }
 
 // Stop simulates a node crash: it drops off the network and its process

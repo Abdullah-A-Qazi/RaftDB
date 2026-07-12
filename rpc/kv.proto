@@ -1,0 +1,65 @@
+// Client-facing key-value API. This is a separate service (and, on each
+// node, a separate listener — client_addr vs raft_addr) from the inter-node
+// Raft RPCs in raft.proto.
+//
+// Leader redirection: any node answers any request, but only the leader can
+// serve it. A non-leader responds with `redirect` filled in, pointing the
+// client at the leader's client address; the client is expected to retry
+// there. This is a deliberate deviation from designs that proxy the request
+// to the leader server-side: redirection keeps the failure story simple
+// (every hop is client-visible) at the cost of one extra round trip after a
+// leadership change.
+
+syntax = "proto3";
+
+package kvpb;
+
+option go_package = "github.com/Abdullah-A-Qazi/RaftDB/rpc/kvpb";
+
+// Redirect is set on any response from a node that is not the current
+// leader. leader_addr may be empty if no leader is known yet (e.g. during
+// an election) — the client should back off and retry anywhere.
+message Redirect {
+  string leader_id = 1;
+  string leader_addr = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message PutResponse {
+  Redirect redirect = 1;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  Redirect redirect = 1;
+  string value = 2;
+  bool found = 3;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  Redirect redirect = 1;
+}
+
+service KV {
+  // Put and Delete go through the Raft log and return only after the
+  // command is committed (majority-replicated) and applied.
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Get is served from the leader's local state machine WITHOUT going
+  // through the log. See docs/phase-2 for why this is not strictly
+  // linearizable (a just-deposed leader can serve a stale read) and what
+  // the fixes are (ReadIndex/leases — future work).
+  rpc Get(GetRequest) returns (GetResponse);
+}
