@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 )
@@ -56,8 +57,8 @@ func (s *Store) Len() int {
 	return len(s.m)
 }
 
-// Snapshot returns a copy of the entire map (test helper; Phase 5 will
-// grow this into real snapshot serialization).
+// Snapshot returns a copy of the entire map (used by tests and as the
+// source for snapshot serialization).
 func (s *Store) Snapshot() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -66,4 +67,27 @@ func (s *Store) Snapshot() map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// SnapshotBytes serializes the full state for a Raft snapshot (Phase 5).
+// JSON, like the command encoding: the state is one map, and debuggable
+// snapshot files beat compact ones while learning.
+func (s *Store) SnapshotBytes() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return json.Marshal(s.m)
+}
+
+// RestoreBytes replaces the entire state with a deserialized snapshot.
+// Replacement (not merge) is the contract: the snapshot IS the state at
+// its log position, including the absence of deleted keys.
+func (s *Store) RestoreBytes(data []byte) error {
+	m := make(map[string]string)
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("kv: corrupt snapshot: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m = m
+	return nil
 }

@@ -124,6 +124,7 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 	// the position just before them. This inductive check is what upholds
 	// the Log Matching Property: if two logs agree on (index, term) at one
 	// position, they agree on everything before it.
+	base := rn.log[0].Index // snapshot boundary; 0 when uncompacted
 	if args.PrevLogIndex > rn.lastLogIndex() {
 		// Our log is too short to even contain the predecessor. Hint the
 		// leader to jump straight to our end instead of probing backwards
@@ -132,18 +133,31 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 		reply.ConflictIndex = rn.lastLogIndex() + 1
 		return reply
 	}
-	if have := rn.termAt(args.PrevLogIndex); have != args.PrevLogTerm {
-		// We have an entry there, but from the wrong term. Hint: the term
-		// we do have, and our first index of that term — the leader can
-		// step over the whole run of bad-term entries at once.
-		reply.ConflictTerm = have
-		first := args.PrevLogIndex
-		for first > 1 && rn.termAt(first-1) == have {
-			first--
+	if args.PrevLogIndex >= base {
+		// (When prevLogIndex == base, termAt returns the snapshot's
+		// lastIncludedTerm via the sentinel — the check §7 requires at
+		// the compaction boundary falls out for free.)
+		if have := rn.termAt(args.PrevLogIndex); have != args.PrevLogTerm {
+			// We have an entry there, but from the wrong term. Hint: the
+			// term we do have, and our first index of that term — the
+			// leader can step over the whole run of bad-term entries at
+			// once. The scan cannot descend past the snapshot boundary:
+			// everything at or below it is committed and cannot be the
+			// divergence point.
+			reply.ConflictTerm = have
+			first := args.PrevLogIndex
+			for first > base+1 && rn.termAt(first-1) == have {
+				first--
+			}
+			reply.ConflictIndex = first
+			return reply
 		}
-		reply.ConflictIndex = first
-		return reply
 	}
+	// args.PrevLogIndex < base: the predecessor is inside our snapshot.
+	// Snapshotted state is committed, and no legitimate leader's log ever
+	// conflicts with committed history (Leader Completeness) — the check
+	// passes by construction; the walk below skips whatever we already
+	// hold.
 
 	// --- Append (§5.3, Figure 2 receiver steps 3–4) ---
 	// Walk the incoming entries; skip everything we already have. We must
@@ -153,6 +167,9 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 	// — including committed ones. Truncation is allowed only on a genuine
 	// term conflict at some index.
 	for i, e := range args.Entries {
+		if e.Index <= base {
+			continue // covered by our snapshot: committed, identical by Leader Completeness
+		}
 		if e.Index <= rn.lastLogIndex() {
 			if rn.termAt(e.Index) == e.Term {
 				continue // already have this exact entry
@@ -196,5 +213,85 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 	}
 
 	reply.Success = true
+	return reply
+}
+
+// HandleInstallSnapshot receives a leader's snapshot (§7, Figure 13) — sent
+// when this follower is so far behind that the entries it needs have been
+// compacted out of the leader's log.
+func (rn *RaftNode) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if rn.stopped {
+		return InstallSnapshotReply{Term: rn.currentTerm}
+	}
+
+	if args.Term > rn.currentTerm {
+		rn.becomeFollowerLocked(args.Term)
+	}
+	reply := InstallSnapshotReply{Term: rn.currentTerm}
+	if args.Term < rn.currentTerm {
+		return reply // stale leader; it will step down on reading our term
+	}
+	// Same term-and-leadership handling as AppendEntries: a snapshot is
+	// leader contact.
+	if rn.state != Follower {
+		rn.becomeFollowerLocked(args.Term)
+	}
+	rn.leaderID = args.LeaderID
+	rn.resetElectionTimerLocked()
+
+	// Ignore snapshots that don't move us forward. Guarding on commitIndex
+	// (not just the snapshot boundary) also protects the applier: entries
+	// up to commitIndex may already be applied or queued for apply, and
+	// restoring an older snapshot over them would rewind the state
+	// machine. (Duplicate deliveries of the same snapshot land here too.)
+	if args.LastIncludedIndex <= rn.commitIndex {
+		return reply
+	}
+
+	// Figure 13 step 6/7: if our log extends beyond the snapshot AND
+	// matches it at the boundary, the suffix is real and survives;
+	// otherwise our entire log is stale (it conflicts with committed
+	// history) and is discarded wholesale.
+	var suffix []LogEntry
+	if args.LastIncludedIndex <= rn.lastLogIndex() &&
+		args.LastIncludedIndex >= rn.log[0].Index &&
+		rn.termAt(args.LastIncludedIndex) == args.LastIncludedTerm {
+		suffix = rn.entriesFrom(args.LastIncludedIndex + 1)
+	}
+
+	// Persist-before-reply, in the only safe order: snapshot first, then
+	// the compacted log. If we crash in between, recovery finds the new
+	// snapshot plus a stale WAL and discards the WAL's covered prefix —
+	// the reverse order could leave a compacted WAL with no snapshot
+	// covering the gap.
+	snap := Snapshot{
+		LastIncludedIndex: args.LastIncludedIndex,
+		LastIncludedTerm:  args.LastIncludedTerm,
+		Data:              args.Data,
+	}
+	if rn.cfg.SnapshotStore != nil {
+		if err := rn.cfg.SnapshotStore.SaveSnapshot(snap); err != nil {
+			panic(fmt.Sprintf("raft %s: persisting installed snapshot: %v", rn.id, err))
+		}
+	}
+	if rn.cfg.LogStore != nil {
+		if err := rn.cfg.LogStore.Compact(suffix); err != nil {
+			panic(fmt.Sprintf("raft %s: compacting log for snapshot: %v", rn.id, err))
+		}
+	}
+	rn.log = append([]LogEntry{{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}}, suffix...)
+	rn.commitIndex = args.LastIncludedIndex
+
+	// The state machine is NOT touched here: only the applier goroutine
+	// may mutate it, or a restore could interleave with an in-flight
+	// Apply batch. Park the snapshot for the applier and wake it.
+	rn.pendingSnapshot = &snap
+	rn.applyCond.Signal()
+
+	rn.logger.Info("installed snapshot", "lastIncludedIndex", args.LastIncludedIndex,
+		"lastIncludedTerm", args.LastIncludedTerm, "retainedEntries", len(suffix))
 	return reply
 }
