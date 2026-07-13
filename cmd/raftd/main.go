@@ -70,6 +70,7 @@ func main() {
 		ID:        self.ID,
 		Peers:     peerIDs,
 		Store:     store,
+		LogStore:  store, // FileStore serves both: hardstate.json + wal.log
 		Transport: transport,
 		Logger:    logger,
 	})

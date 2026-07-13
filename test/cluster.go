@@ -118,6 +118,7 @@ func (c *Cluster) startNode(id string) {
 		ID:                 id,
 		Peers:              peers,
 		Store:              store,
+		LogStore:           store, // real WAL: harness restarts recover from disk
 		Transport:          &memTransport{c: c, from: id},
 		ElectionTimeoutMin: electionMin,
 		ElectionTimeoutMax: electionMax,

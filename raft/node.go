@@ -91,6 +91,12 @@ type Config struct {
 	// Store persists HardState. Required.
 	Store StateStore
 
+	// LogStore persists the replicated log (Phase 4). May be nil ONLY in
+	// tests: a nil LogStore means the log is volatile, which silently
+	// voids the durability half of Raft's guarantees — raftd always wires
+	// one.
+	LogStore LogStore
+
 	// Transport sends RPCs to peers. Required by Start; may be nil for
 	// tests that only poke the RPC handlers.
 	Transport Transport
@@ -292,6 +298,32 @@ func NewNode(cfg Config) (*RaftNode, error) {
 		rn.votedFor = hs.VotedFor
 		rn.logger.Info("recovered hard state", "term", rn.currentTerm, "votedFor", rn.votedFor)
 	}
+
+	// Recover the log (Phase 4). commitIndex and lastApplied deliberately
+	// stay 0 — Figure 2 marks them volatile. We re-learn commitIndex from
+	// the next leader's AppendEntries (or by becoming leader), and the
+	// applier then replays the committed prefix into the state machine,
+	// rebuilding it from scratch. Persisting commitIndex would only be an
+	// optimization; persisting the log is what's load-bearing.
+	if cfg.LogStore != nil {
+		entries, err := cfg.LogStore.LoadEntries()
+		if err != nil {
+			return nil, fmt.Errorf("raft: loading log: %w", err)
+		}
+		for i, e := range entries {
+			// The sentinel occupies slot 0, so entry i must be index i+1;
+			// anything else means the store handed us a corrupt log and
+			// every index formula in this package would be silently wrong.
+			if e.Index != uint64(i)+1 {
+				return nil, fmt.Errorf("raft: recovered log is not contiguous: entry %d has index %d", i, e.Index)
+			}
+			rn.log = append(rn.log, e)
+		}
+		if len(entries) > 0 {
+			rn.logger.Info("recovered log", "entries", len(entries),
+				"lastIndex", rn.lastLogIndex(), "lastTerm", rn.lastLogTerm())
+		}
+	}
 	return rn, nil
 }
 
@@ -360,9 +392,10 @@ func (rn *RaftNode) Propose(command []byte) (index, term uint64, err error) {
 	}
 	index = rn.lastLogIndex() + 1
 	term = rn.currentTerm
-	rn.log = append(rn.log, LogEntry{Term: term, Index: index, Command: command})
-	// The log itself is in-memory until Phase 4's WAL — a crash here loses
-	// the entry, which is fine: it was never acknowledged to anyone.
+	// Durable before anything counts it: the leader is one of the quorum
+	// members backing this entry, so its own copy must survive a crash
+	// just like a follower's must before its ack.
+	rn.appendLogLocked(LogEntry{Term: term, Index: index, Command: command})
 	rn.advanceCommitIndexLocked() // single-node cluster commits immediately
 	rn.mu.Unlock()
 
@@ -490,12 +523,35 @@ func (rn *RaftNode) entriesFrom(from uint64) []LogEntry {
 	return out
 }
 
-// truncateFrom drops every entry with index >= from (from must be >= 1; the
-// sentinel is never dropped). Only ever called on conflicting, uncommitted
-// suffixes — see HandleAppendEntries for the guard rails.
+// appendLogLocked appends entries to the log, durably first: the WAL write
+// (with fsync) completes before the in-memory log — and therefore before
+// any reply or quorum count derived from it — can observe the entries.
+// This is the log's half of the persist-before-reply invariant; HardState's
+// half lives in persistLocked. A LogStore failure panics for the same
+// fail-stop reason.
 //
 // Callers must hold rn.mu.
-func (rn *RaftNode) truncateFrom(from uint64) {
+func (rn *RaftNode) appendLogLocked(entries ...LogEntry) {
+	if rn.cfg.LogStore != nil {
+		if err := rn.cfg.LogStore.AppendEntries(entries); err != nil {
+			panic(fmt.Sprintf("raft %s: persisting log entries: %v", rn.id, err))
+		}
+	}
+	rn.log = append(rn.log, entries...)
+}
+
+// truncateLogLocked drops every entry with index >= from (from must be
+// >= 1; the sentinel is never dropped), durably. Only ever called on
+// conflicting, uncommitted suffixes — see HandleAppendEntries for the
+// guard rails.
+//
+// Callers must hold rn.mu.
+func (rn *RaftNode) truncateLogLocked(from uint64) {
+	if rn.cfg.LogStore != nil {
+		if err := rn.cfg.LogStore.TruncateSuffix(from); err != nil {
+			panic(fmt.Sprintf("raft %s: persisting log truncation: %v", rn.id, err))
+		}
+	}
 	rn.log = rn.log[:from]
 }
 
