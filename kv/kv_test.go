@@ -73,7 +73,7 @@ func TestStoreApplyAndGet(t *testing.T) {
 
 type nopStore struct{}
 
-func (nopStore) SaveHardState(raft.HardState) error          { return nil }
+func (nopStore) SaveHardState(raft.HardState) error           { return nil }
 func (nopStore) LoadHardState() (raft.HardState, bool, error) { return raft.HardState{}, false, nil }
 
 func newFollowerServer(t *testing.T) *Server {

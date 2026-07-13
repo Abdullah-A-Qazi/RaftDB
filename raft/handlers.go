@@ -12,6 +12,12 @@ func (rn *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
+	// A stopped instance is a dead process: it must neither answer nor
+	// touch disk (a restarted incarnation may own the files now).
+	if rn.stopped {
+		return RequestVoteReply{Term: rn.currentTerm}
+	}
+
 	// Rules for Servers: any RPC with a term above ours moves us to that
 	// term as a follower — and clears votedFor, because a vote binds to a
 	// specific term and we have never voted in this new one.
@@ -79,6 +85,12 @@ func (rn *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
+
+	// See HandleRequestVote: stopped means dead, and dead nodes don't
+	// write to disk.
+	if rn.stopped {
+		return AppendEntriesReply{Term: rn.currentTerm}
+	}
 
 	if args.Term > rn.currentTerm {
 		rn.becomeFollowerLocked(args.Term)
@@ -160,9 +172,13 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 					"raft %s: leader %s (term %d) asks to truncate committed entry %d (commitIndex %d) — Leader Completeness violated",
 					rn.id, args.LeaderID, args.Term, e.Index, rn.commitIndex))
 			}
-			rn.truncateFrom(e.Index)
+			rn.truncateLogLocked(e.Index)
 		}
-		rn.log = append(rn.log, args.Entries[i:]...)
+		// Durable (WAL + fsync) before the Success reply leaves: the
+		// leader will count this follower toward the entries' quorum the
+		// moment it reads the reply, and a counted copy must survive
+		// kill -9.
+		rn.appendLogLocked(args.Entries[i:]...)
 		break
 	}
 
