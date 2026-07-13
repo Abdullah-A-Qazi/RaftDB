@@ -35,10 +35,13 @@ type Cluster struct {
 	t   *testing.T
 	ids []string
 
+	snapshotThreshold uint64 // 0 = snapshotting disabled
+
 	mu        sync.Mutex
 	nodes     map[string]*raft.RaftNode // nil entry = not running
 	dirs      map[string]string         // per-node durable state, survives restarts
 	connected map[string]bool
+	snapsSent map[string]int // InstallSnapshot RPCs delivered, by target
 
 	// KV layer, one per running node. Rebuilt from scratch on restart —
 	// the log replay through normal replication is what repopulates it.
@@ -52,8 +55,9 @@ type Cluster struct {
 type applyRecorder struct {
 	inner raft.StateMachine
 
-	mu      sync.Mutex
-	indexes []uint64
+	mu       sync.Mutex
+	indexes  []uint64
+	restores int
 }
 
 func (r *applyRecorder) Apply(e raft.LogEntry) {
@@ -61,6 +65,17 @@ func (r *applyRecorder) Apply(e raft.LogEntry) {
 	r.indexes = append(r.indexes, e.Index)
 	r.mu.Unlock()
 	r.inner.Apply(e)
+}
+
+func (r *applyRecorder) Snapshot() ([]byte, error) {
+	return r.inner.Snapshot()
+}
+
+func (r *applyRecorder) Restore(snapshot []byte) error {
+	r.mu.Lock()
+	r.restores++
+	r.mu.Unlock()
+	return r.inner.Restore(snapshot)
 }
 
 func (r *applyRecorder) applied() []uint64 {
@@ -78,16 +93,25 @@ func clientAddr(id string) string { return "client-addr-" + id }
 
 // NewCluster starts n nodes (node1..nodeN) with real FileStore persistence
 // in per-node temp dirs, so Restart genuinely recovers from disk.
+// Snapshotting is disabled — the Phases 1–4 behavior.
 func NewCluster(t *testing.T, n int) *Cluster {
+	return NewSnapshottingCluster(t, n, 0)
+}
+
+// NewSnapshottingCluster is NewCluster with log compaction enabled: every
+// node snapshots and compacts after `threshold` applied entries accumulate.
+func NewSnapshottingCluster(t *testing.T, n int, threshold uint64) *Cluster {
 	t.Helper()
 	c := &Cluster{
-		t:         t,
-		nodes:     make(map[string]*raft.RaftNode, n),
-		dirs:      make(map[string]string, n),
-		connected: make(map[string]bool, n),
-		stores:    make(map[string]*kv.Store, n),
-		kvs:       make(map[string]*kv.Server, n),
-		recorders: make(map[string]*applyRecorder, n),
+		t:                 t,
+		snapshotThreshold: threshold,
+		nodes:             make(map[string]*raft.RaftNode, n),
+		dirs:              make(map[string]string, n),
+		connected:         make(map[string]bool, n),
+		snapsSent:         make(map[string]int, n),
+		stores:            make(map[string]*kv.Store, n),
+		kvs:               make(map[string]*kv.Server, n),
+		recorders:         make(map[string]*applyRecorder, n),
 	}
 	for i := 1; i <= n; i++ {
 		id := fmt.Sprintf("node%d", i)
@@ -119,6 +143,8 @@ func (c *Cluster) startNode(id string) {
 		Peers:              peers,
 		Store:              store,
 		LogStore:           store, // real WAL: harness restarts recover from disk
+		SnapshotStore:      store,
+		SnapshotThreshold:  c.snapshotThreshold,
 		Transport:          &memTransport{c: c, from: id},
 		ElectionTimeoutMin: electionMin,
 		ElectionTimeoutMax: electionMax,
@@ -458,4 +484,23 @@ func (t *memTransport) AppendEntries(ctx context.Context, to string, args raft.A
 		return raft.AppendEntriesReply{}, err
 	}
 	return node.HandleAppendEntries(args), nil
+}
+
+func (t *memTransport) InstallSnapshot(ctx context.Context, to string, args raft.InstallSnapshotArgs) (raft.InstallSnapshotReply, error) {
+	node, err := t.target(to)
+	if err != nil {
+		return raft.InstallSnapshotReply{}, err
+	}
+	t.c.mu.Lock()
+	t.c.snapsSent[to]++
+	t.c.mu.Unlock()
+	return node.HandleInstallSnapshot(args), nil
+}
+
+// SnapshotsDeliveredTo reports how many InstallSnapshot RPCs a node has
+// received — the assertion that catch-up went via snapshot, not entries.
+func (c *Cluster) SnapshotsDeliveredTo(id string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.snapsSent[id]
 }

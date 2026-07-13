@@ -79,6 +79,26 @@ func (t *Transport) AppendEntries(ctx context.Context, peerID string, args raft.
 	}, nil
 }
 
+func (t *Transport) InstallSnapshot(ctx context.Context, peerID string, args raft.InstallSnapshotArgs) (raft.InstallSnapshotReply, error) {
+	c, ok := t.clients[peerID]
+	if !ok {
+		return raft.InstallSnapshotReply{}, fmt.Errorf("rpc: unknown peer %q", peerID)
+	}
+	resp, err := c.InstallSnapshot(ctx, &raftpb.InstallSnapshotRequest{
+		Term:              args.Term,
+		LeaderId:          args.LeaderID,
+		LastIncludedIndex: args.LastIncludedIndex,
+		LastIncludedTerm:  args.LastIncludedTerm,
+		Offset:            args.Offset,
+		Data:              args.Data,
+		Done:              args.Done,
+	})
+	if err != nil {
+		return raft.InstallSnapshotReply{}, err
+	}
+	return raft.InstallSnapshotReply{Term: resp.Term}, nil
+}
+
 // Close tears down all peer connections.
 func (t *Transport) Close() {
 	for _, conn := range t.conns {

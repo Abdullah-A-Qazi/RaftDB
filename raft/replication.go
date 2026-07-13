@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -35,12 +36,14 @@ func (rn *RaftNode) runReplication(term uint64) {
 	}
 }
 
-// replicationRound sends one AppendEntries to every peer. Returns false
+// replicationRound sends one AppendEntries (or, for peers that need
+// compacted-away entries, one InstallSnapshot) to every peer. Returns false
 // when this node is no longer leader of `term` and the loop should exit.
 func (rn *RaftNode) replicationRound(term uint64) bool {
 	type outbound struct {
-		peer string
-		args AppendEntriesArgs
+		peer     string
+		args     AppendEntriesArgs
+		snapshot bool // send a snapshot instead of entries
 	}
 
 	rn.mu.Lock()
@@ -48,10 +51,18 @@ func (rn *RaftNode) replicationRound(term uint64) bool {
 		rn.mu.Unlock()
 		return false
 	}
+	base := rn.log[0].Index
 	msgs := make([]outbound, 0, len(rn.peers))
 	for _, peer := range rn.peers {
 		next := rn.nextIndex[peer]
-		prevIndex := next - 1 // >= 0 always: nextIndex is never below 1
+		if next <= base {
+			// The entry this follower needs next (and possibly the
+			// (index, term) pair to run the consistency check against)
+			// is gone from our log — only the snapshot covers it (§7).
+			msgs = append(msgs, outbound{peer: peer, snapshot: true})
+			continue
+		}
+		prevIndex := next - 1 // >= base: sentinel covers the boundary case
 		msgs = append(msgs, outbound{peer: peer, args: AppendEntriesArgs{
 			Term:         term,
 			LeaderID:     rn.id,
@@ -66,6 +77,10 @@ func (rn *RaftNode) replicationRound(term uint64) bool {
 	rn.mu.Unlock()
 
 	for _, m := range msgs {
+		if m.snapshot {
+			go rn.sendSnapshot(m.peer, term)
+			continue
+		}
 		go func(peer string, args AppendEntriesArgs) {
 			ctx, cancel := context.WithTimeout(context.Background(), rn.cfg.RPCTimeout)
 			defer cancel()
@@ -77,6 +92,58 @@ func (rn *RaftNode) replicationRound(term uint64) bool {
 		}(m.peer, m.args)
 	}
 	return true
+}
+
+// sendSnapshot ships the current on-disk snapshot to one lagging follower.
+// Loaded from the store per send rather than cached: it's the rare path,
+// and the store is the one source of truth for "latest snapshot".
+func (rn *RaftNode) sendSnapshot(peer string, term uint64) {
+	snap, found, err := rn.cfg.SnapshotStore.LoadSnapshot()
+	if err != nil || !found {
+		// A peer needs entries below our log base yet we have no
+		// snapshot: only possible if compaction and this send raced a
+		// crash. The next round retries; log it and move on.
+		rn.logger.Error("snapshot needed but not loadable", "peer", peer, "err", err)
+		return
+	}
+	args := InstallSnapshotArgs{
+		Term:              term,
+		LeaderID:          rn.id,
+		LastIncludedIndex: snap.LastIncludedIndex,
+		LastIncludedTerm:  snap.LastIncludedTerm,
+		Data:              snap.Data,
+		// Single-chunk transfer (deviation from §7's Offset/Done
+		// chunking, flagged in docs/phase-5).
+		Offset: 0,
+		Done:   true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), rn.cfg.RPCTimeout)
+	defer cancel()
+	reply, err := rn.cfg.Transport.InstallSnapshot(ctx, peer, args)
+	if err != nil {
+		return // unreachable; next round retries
+	}
+
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	if rn.stopped {
+		return
+	}
+	if reply.Term > rn.currentTerm {
+		rn.becomeFollowerLocked(reply.Term)
+		return
+	}
+	if rn.state != Leader || rn.currentTerm != term {
+		return // stale reply from a previous leadership
+	}
+	// The follower now provably holds everything through the snapshot;
+	// replication resumes with real entries right after it. No commit
+	// advancement can result: a snapshot only ever covers entries we had
+	// already committed and applied ourselves.
+	if snap.LastIncludedIndex > rn.matchIndex[peer] {
+		rn.matchIndex[peer] = snap.LastIncludedIndex
+		rn.nextIndex[peer] = snap.LastIncludedIndex + 1
+	}
 }
 
 // handleAppendEntriesReply digests one follower's response.
@@ -232,18 +299,40 @@ func (rn *RaftNode) advanceCommitIndexLocked() {
 // runApplier is the single goroutine that feeds committed entries to the
 // state machine, in order. Single, so that "exactly once, in log order" is
 // enforced by construction rather than by locking discipline in the state
-// machine.
+// machine. It is also the only place snapshots touch the state machine —
+// restores (from InstallSnapshot) and captures (threshold compaction) both
+// happen here, so neither can ever interleave with an Apply.
 func (rn *RaftNode) runApplier() {
 	defer rn.wg.Done()
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 	for {
-		for rn.lastApplied >= rn.commitIndex && !rn.stopped {
+		for rn.pendingSnapshot == nil && rn.lastApplied >= rn.commitIndex && !rn.stopped {
 			rn.applyCond.Wait()
 		}
 		if rn.stopped {
 			return
 		}
+
+		// A parked snapshot from HandleInstallSnapshot takes priority
+		// over applying entries: it supersedes everything it covers.
+		if snap := rn.pendingSnapshot; snap != nil {
+			rn.pendingSnapshot = nil
+			if snap.LastIncludedIndex > rn.lastApplied {
+				rn.mu.Unlock()
+				if err := rn.stateMachine.Restore(snap.Data); err != nil {
+					panic(fmt.Sprintf("raft %s: restoring snapshot at %d: %v",
+						rn.id, snap.LastIncludedIndex, err))
+				}
+				rn.mu.Lock()
+				// Entries through the snapshot are now reflected in the
+				// state machine. Any in-between Apply of older entries
+				// was harmless: Restore replaced the whole state.
+				rn.lastApplied = snap.LastIncludedIndex
+			}
+			continue
+		}
+
 		// Snapshot the batch and release the lock while applying: Apply
 		// runs user code (the KV store, waiter callbacks) that must not be
 		// able to deadlock raft, and RPC handlers must not stall behind it.
@@ -259,5 +348,47 @@ func (rn *RaftNode) runApplier() {
 		// Safe against races because only this goroutine writes
 		// lastApplied — commitIndex may have moved on, the loop re-checks.
 		rn.lastApplied += uint64(len(batch))
+
+		rn.maybeSnapshotLocked()
 	}
+}
+
+// maybeSnapshotLocked compacts the log once it has outgrown the configured
+// threshold: serialize the state machine as of lastApplied, persist the
+// snapshot, drop the covered log prefix. Runs on the applier goroutine —
+// see runApplier for why that's what makes Snapshot race-free.
+//
+// Callers must hold rn.mu; the lock is released during serialization.
+func (rn *RaftNode) maybeSnapshotLocked() {
+	if rn.cfg.SnapshotStore == nil || rn.cfg.SnapshotThreshold == 0 || rn.stateMachine == nil {
+		return
+	}
+	if rn.lastApplied-rn.log[0].Index < rn.cfg.SnapshotThreshold {
+		return
+	}
+	snapIndex := rn.lastApplied
+	snapTerm := rn.termAt(snapIndex)
+
+	rn.mu.Unlock()
+	// Nothing else applies while we're here (single applier), so this
+	// captures the state at exactly snapIndex.
+	data, err := rn.stateMachine.Snapshot()
+	rn.mu.Lock()
+	if err != nil {
+		panic(fmt.Sprintf("raft %s: serializing state machine snapshot: %v", rn.id, err))
+	}
+	// Re-check under the lock: an InstallSnapshot may have advanced the
+	// base past our capture while it was being serialized.
+	if snapIndex <= rn.log[0].Index {
+		return
+	}
+	if err := rn.cfg.SnapshotStore.SaveSnapshot(Snapshot{
+		LastIncludedIndex: snapIndex,
+		LastIncludedTerm:  snapTerm,
+		Data:              data,
+	}); err != nil {
+		panic(fmt.Sprintf("raft %s: persisting snapshot: %v", rn.id, err))
+	}
+	// Snapshot durable → now (and only now) the covered entries may go.
+	rn.compactLogLocked(snapIndex, snapTerm)
 }

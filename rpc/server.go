@@ -7,9 +7,6 @@ package rpc
 import (
 	"context"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	"github.com/Abdullah-A-Qazi/RaftDB/raft"
 	"github.com/Abdullah-A-Qazi/RaftDB/rpc/raftpb"
 )
@@ -55,7 +52,16 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReq
 }
 
 func (s *Server) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "InstallSnapshot arrives in Phase 5")
+	reply := s.node.HandleInstallSnapshot(raft.InstallSnapshotArgs{
+		Term:              req.Term,
+		LeaderID:          req.LeaderId,
+		LastIncludedIndex: req.LastIncludedIndex,
+		LastIncludedTerm:  req.LastIncludedTerm,
+		Offset:            req.Offset,
+		Data:              req.Data,
+		Done:              req.Done,
+	})
+	return &raftpb.InstallSnapshotResponse{Term: reply.Term}, nil
 }
 
 func entriesFromProto(in []*raftpb.LogEntry) []raft.LogEntry {
