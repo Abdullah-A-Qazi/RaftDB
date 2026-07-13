@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -49,8 +50,9 @@ func (m *memStore) saveCount() int {
 
 // fakeTransport scripts peer behavior per RPC type.
 type fakeTransport struct {
-	requestVote   func(peerID string, args RequestVoteArgs) (RequestVoteReply, error)
-	appendEntries func(peerID string, args AppendEntriesArgs) (AppendEntriesReply, error)
+	requestVote     func(peerID string, args RequestVoteArgs) (RequestVoteReply, error)
+	appendEntries   func(peerID string, args AppendEntriesArgs) (AppendEntriesReply, error)
+	installSnapshot func(peerID string, args InstallSnapshotArgs) (InstallSnapshotReply, error)
 }
 
 func (f *fakeTransport) RequestVote(ctx context.Context, peerID string, args RequestVoteArgs) (RequestVoteReply, error) {
@@ -62,6 +64,14 @@ func (f *fakeTransport) AppendEntries(ctx context.Context, peerID string, args A
 		return AppendEntriesReply{Term: args.Term, Success: true}, nil
 	}
 	return f.appendEntries(peerID, args)
+}
+
+func (f *fakeTransport) InstallSnapshot(ctx context.Context, peerID string, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	if f.installSnapshot == nil {
+		// Tests that don't script snapshots shouldn't trigger them.
+		return InstallSnapshotReply{}, errors.New("fakeTransport: InstallSnapshot not scripted")
+	}
+	return f.installSnapshot(peerID, args)
 }
 
 func testLogger(t *testing.T) *slog.Logger {

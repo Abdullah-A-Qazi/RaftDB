@@ -48,6 +48,50 @@ type LogStore interface {
 	// implementation's job — a torn record was never acknowledged to
 	// anyone and must simply be discarded.
 	LoadEntries() ([]LogEntry, error)
+
+	// Compact durably replaces the whole log with just `entries` (the
+	// suffix not covered by a snapshot; may be empty). Called only after
+	// the covering snapshot is safely on disk. This is where WAL space is
+	// reclaimed (Phase 5).
+	Compact(entries []LogEntry) error
+}
+
+// Snapshot is a point-in-time serialization of the state machine plus the
+// log position it covers (§7). LastIncludedIndex/Term must be retained
+// because the AppendEntries consistency check for the first entry AFTER the
+// snapshot needs the (index, term) of the entry just before it — which the
+// snapshot has replaced.
+type Snapshot struct {
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
+}
+
+// SnapshotStore persists the latest snapshot. Save must be atomic and
+// durable before returning (same discipline as HardState): a snapshot
+// replaces log entries, so a half-written snapshot plus a compacted WAL
+// would be a node that lost committed state. Only the newest snapshot is
+// kept — an older one is strictly redundant with it.
+type SnapshotStore interface {
+	SaveSnapshot(snap Snapshot) error
+	LoadSnapshot() (snap Snapshot, found bool, err error)
+}
+
+// InstallSnapshotArgs / InstallSnapshotReply (§7, Figure 13). Offset/Done
+// exist on the wire for the paper's chunked transfer; this implementation
+// always sends one chunk (Offset 0, Done true) — flagged in docs/phase-5.
+type InstallSnapshotArgs struct {
+	Term              uint64
+	LeaderID          string
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Offset            uint64
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term uint64
 }
 
 // RequestVoteArgs / RequestVoteReply mirror the proto messages in
@@ -99,5 +143,5 @@ type AppendEntriesReply struct {
 type Transport interface {
 	RequestVote(ctx context.Context, peerID string, args RequestVoteArgs) (RequestVoteReply, error)
 	AppendEntries(ctx context.Context, peerID string, args AppendEntriesArgs) (AppendEntriesReply, error)
-	// InstallSnapshot is added in Phase 5.
+	InstallSnapshot(ctx context.Context, peerID string, args InstallSnapshotArgs) (InstallSnapshotReply, error)
 }

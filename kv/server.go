@@ -70,6 +70,22 @@ func (s *Server) Apply(entry raft.LogEntry) {
 	s.fireWaiter(entry)
 }
 
+// Snapshot implements raft.StateMachine (Phase 5): serialize the store as
+// of everything applied so far. Called from Raft's applier goroutine, so it
+// can never race an Apply.
+func (s *Server) Snapshot() ([]byte, error) {
+	return s.store.SnapshotBytes()
+}
+
+// Restore implements raft.StateMachine: replace the store's state with a
+// snapshot received from the leader (or recovered from disk at startup).
+// Waiters are untouched: a node receiving a snapshot is a follower, and
+// followers hold no waiters (any leftovers from an old leadership time out
+// on their own — documented client-visible behavior).
+func (s *Server) Restore(snapshot []byte) error {
+	return s.store.RestoreBytes(snapshot)
+}
+
 // fireWaiter completes the client request (if any) parked on this index.
 //
 // The term comparison is the whole trick: Propose returned (index, term),
