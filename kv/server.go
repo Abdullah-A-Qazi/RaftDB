@@ -186,6 +186,26 @@ func (s *Server) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.Del
 	return &kvpb.DeleteResponse{}, nil
 }
 
+// Status reports this node's own view of the cluster (any node answers;
+// no redirect). During elections or partitions different nodes disagree —
+// surfacing that disagreement is the point of the endpoint.
+func (s *Server) Status(ctx context.Context, req *kvpb.StatusRequest) (*kvpb.StatusResponse, error) {
+	st := s.node.Status()
+	return &kvpb.StatusResponse{
+		NodeId:        st.ID,
+		State:         st.State.String(),
+		CurrentTerm:   st.CurrentTerm,
+		VotedFor:      st.VotedFor,
+		LeaderId:      st.LeaderID,
+		CommitIndex:   st.CommitIndex,
+		LastApplied:   st.LastApplied,
+		LastLogIndex:  st.LastLogIndex,
+		LastLogTerm:   st.LastLogTerm,
+		FirstLogIndex: st.FirstLogIndex,
+		Keys:          uint64(s.store.Len()),
+	}, nil
+}
+
 // Get serves reads from the leader's local store, without going through
 // the log.
 //

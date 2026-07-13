@@ -51,6 +51,27 @@ message DeleteResponse {
   Redirect redirect = 1;
 }
 
+// Status reports one node's own view of the world — served locally by any
+// node (leader or not), so a dashboard/CLI can render the whole cluster by
+// asking everyone. Values are this node's opinion and can lag or disagree
+// across nodes during elections/partitions; that disagreement is the
+// interesting part to display, not an error.
+message StatusRequest {}
+
+message StatusResponse {
+  string node_id = 1;
+  string state = 2; // "Follower" | "Candidate" | "Leader"
+  uint64 current_term = 3;
+  string voted_for = 4;
+  string leader_id = 5;
+  uint64 commit_index = 6;
+  uint64 last_applied = 7;
+  uint64 last_log_index = 8;
+  uint64 last_log_term = 9;
+  uint64 first_log_index = 10; // >1 means the log was compacted into a snapshot
+  uint64 keys = 11;            // entries in the KV state machine
+}
+
 service KV {
   // Put and Delete go through the Raft log and return only after the
   // command is committed (majority-replicated) and applied.
@@ -62,4 +83,7 @@ service KV {
   // linearizable (a just-deposed leader can serve a stale read) and what
   // the fixes are (ReadIndex/leases — future work).
   rpc Get(GetRequest) returns (GetResponse);
+
+  // Status is answered by every node about itself (no redirect).
+  rpc Status(StatusRequest) returns (StatusResponse);
 }
