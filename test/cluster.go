@@ -43,6 +43,13 @@ type Cluster struct {
 	connected map[string]bool
 	snapsSent map[string]int // InstallSnapshot RPCs delivered, by target
 
+	// blocked is the partition matrix (Phase 6): blocked[from][to] drops
+	// every RPC from → to while leaving both processes running — a network
+	// failure, not a crash. Directional on purpose: real partitions are
+	// routinely asymmetric (a link that delivers one way), and Raft's
+	// nastiest liveness scenarios come from exactly that.
+	blocked map[string]map[string]bool
+
 	// KV layer, one per running node. Rebuilt from scratch on restart —
 	// the log replay through normal replication is what repopulates it.
 	stores    map[string]*kv.Store
@@ -109,6 +116,7 @@ func NewSnapshottingCluster(t *testing.T, n int, threshold uint64) *Cluster {
 		dirs:              make(map[string]string, n),
 		connected:         make(map[string]bool, n),
 		snapsSent:         make(map[string]int, n),
+		blocked:           make(map[string]map[string]bool, n),
 		stores:            make(map[string]*kv.Store, n),
 		kvs:               make(map[string]*kv.Server, n),
 		recorders:         make(map[string]*applyRecorder, n),
@@ -266,14 +274,54 @@ func (c *Cluster) GetFromLeader(key string) (string, bool) {
 }
 
 // pickLeaderKV returns the KV server of the node currently believing it is
-// leader (among running, connected nodes), or nil.
+// leader (among running, connected nodes), or nil. When several nodes claim
+// leadership — a stale leader on the wrong side of a partition plus the
+// real one — the highest term wins: stale claimants are always behind in
+// term, and asking them would just burn a proposal timeout.
 func (c *Cluster) pickLeaderKV() (string, *kv.Server) {
+	best := ""
+	var bestTerm uint64
 	for id, s := range c.Statuses() {
-		if s.State == raft.Leader {
-			return id, c.KV(id)
+		if s.State == raft.Leader && s.CurrentTerm > bestTerm {
+			best, bestTerm = id, s.CurrentTerm
 		}
 	}
-	return "", nil
+	if best == "" {
+		return "", nil
+	}
+	return best, c.KV(best)
+}
+
+// LeadersAmong returns which of the given nodes currently claim leadership.
+func (c *Cluster) LeadersAmong(ids []string) []string {
+	var out []string
+	for _, id := range ids {
+		c.mu.Lock()
+		node := c.nodes[id]
+		c.mu.Unlock()
+		if node != nil && node.Status().State == raft.Leader {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// WaitForLeaderAmong waits until exactly one of the given nodes claims
+// leadership and returns it — the per-side form of WaitForLeader for use
+// during partitions.
+func (c *Cluster) WaitForLeaderAmong(ids []string, timeout time.Duration) string {
+	c.t.Helper()
+	var last []string
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		last = c.LeadersAmong(ids)
+		if len(last) == 1 {
+			return last[0]
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.t.Fatalf("no single leader among %v within %v (leaders: %v)", ids, timeout, last)
+	return ""
 }
 
 // Stop simulates a node crash: it drops off the network and its process
@@ -318,6 +366,57 @@ func (c *Cluster) Reconnect(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.connected[id] = true
+}
+
+// BlockLink drops all RPCs sent from → to (one direction only). Both nodes
+// stay up and all their other links keep working.
+func (c *Cluster) BlockLink(from, to string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.blockLinkLocked(from, to)
+}
+
+func (c *Cluster) blockLinkLocked(from, to string) {
+	if c.blocked[from] == nil {
+		c.blocked[from] = make(map[string]bool)
+	}
+	c.blocked[from][to] = true
+}
+
+// UnblockLink restores one direction of one link.
+func (c *Cluster) UnblockLink(from, to string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.blocked[from], to)
+}
+
+// Partition splits the cluster in two: the given nodes on one side,
+// everyone else on the other. All links across the cut are blocked in both
+// directions; links within each side are untouched. Replaces any previous
+// partition (call Heal first for a clean slate if composing manually).
+func (c *Cluster) Partition(side ...string) {
+	inSide := make(map[string]bool, len(side))
+	for _, id := range side {
+		inSide[id] = true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.blocked = make(map[string]map[string]bool, len(c.ids))
+	for _, a := range c.ids {
+		for _, b := range c.ids {
+			if a != b && inSide[a] != inSide[b] {
+				c.blockLinkLocked(a, b)
+			}
+		}
+	}
+}
+
+// Heal removes every link block (partitions only — crashed/disconnected
+// nodes stay as they are).
+func (c *Cluster) Heal() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.blocked = make(map[string]map[string]bool, len(c.ids))
 }
 
 // Shutdown stops every running node.
@@ -462,6 +561,9 @@ func (t *memTransport) target(to string) (*raft.RaftNode, error) {
 	}
 	if !t.c.connected[to] {
 		return nil, fmt.Errorf("memtransport: %s is disconnected", to)
+	}
+	if t.c.blocked[t.from][to] {
+		return nil, fmt.Errorf("memtransport: link %s -> %s is partitioned", t.from, to)
 	}
 	node := t.c.nodes[to]
 	if node == nil {
