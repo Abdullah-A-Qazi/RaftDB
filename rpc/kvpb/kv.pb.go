@@ -376,6 +376,171 @@ func (x *DeleteResponse) GetRedirect() *Redirect {
 	return nil
 }
 
+// Status reports one node's own view of the world — served locally by any
+// node (leader or not), so a dashboard/CLI can render the whole cluster by
+// asking everyone. Values are this node's opinion and can lag or disagree
+// across nodes during elections/partitions; that disagreement is the
+// interesting part to display, not an error.
+type StatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StatusRequest) Reset() {
+	*x = StatusRequest{}
+	mi := &file_rpc_kv_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StatusRequest) ProtoMessage() {}
+
+func (x *StatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_rpc_kv_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
+func (*StatusRequest) Descriptor() ([]byte, []int) {
+	return file_rpc_kv_proto_rawDescGZIP(), []int{7}
+}
+
+type StatusResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	State         string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"` // "Follower" | "Candidate" | "Leader"
+	CurrentTerm   uint64                 `protobuf:"varint,3,opt,name=current_term,json=currentTerm,proto3" json:"current_term,omitempty"`
+	VotedFor      string                 `protobuf:"bytes,4,opt,name=voted_for,json=votedFor,proto3" json:"voted_for,omitempty"`
+	LeaderId      string                 `protobuf:"bytes,5,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	CommitIndex   uint64                 `protobuf:"varint,6,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	LastApplied   uint64                 `protobuf:"varint,7,opt,name=last_applied,json=lastApplied,proto3" json:"last_applied,omitempty"`
+	LastLogIndex  uint64                 `protobuf:"varint,8,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm   uint64                 `protobuf:"varint,9,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	FirstLogIndex uint64                 `protobuf:"varint,10,opt,name=first_log_index,json=firstLogIndex,proto3" json:"first_log_index,omitempty"` // >1 means the log was compacted into a snapshot
+	Keys          uint64                 `protobuf:"varint,11,opt,name=keys,proto3" json:"keys,omitempty"`                                          // entries in the KV state machine
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StatusResponse) Reset() {
+	*x = StatusResponse{}
+	mi := &file_rpc_kv_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StatusResponse) ProtoMessage() {}
+
+func (x *StatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_rpc_kv_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
+func (*StatusResponse) Descriptor() ([]byte, []int) {
+	return file_rpc_kv_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *StatusResponse) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetCurrentTerm() uint64 {
+	if x != nil {
+		return x.CurrentTerm
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetVotedFor() string {
+	if x != nil {
+		return x.VotedFor
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetLeaderId() string {
+	if x != nil {
+		return x.LeaderId
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetCommitIndex() uint64 {
+	if x != nil {
+		return x.CommitIndex
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetLastApplied() uint64 {
+	if x != nil {
+		return x.LastApplied
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetLastLogIndex() uint64 {
+	if x != nil {
+		return x.LastLogIndex
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetLastLogTerm() uint64 {
+	if x != nil {
+		return x.LastLogTerm
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetFirstLogIndex() uint64 {
+	if x != nil {
+		return x.FirstLogIndex
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetKeys() uint64 {
+	if x != nil {
+		return x.Keys
+	}
+	return 0
+}
+
 var File_rpc_kv_proto protoreflect.FileDescriptor
 
 const file_rpc_kv_proto_rawDesc = "" +
@@ -401,11 +566,26 @@ const file_rpc_kv_proto_rawDesc = "" +
 	"\rDeleteRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\"<\n" +
 	"\x0eDeleteResponse\x12*\n" +
-	"\bredirect\x18\x01 \x01(\v2\x0e.kvpb.RedirectR\bredirect2\x91\x01\n" +
+	"\bredirect\x18\x01 \x01(\v2\x0e.kvpb.RedirectR\bredirect\"\x0f\n" +
+	"\rStatusRequest\"\xe8\x02\n" +
+	"\x0eStatusResponse\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x14\n" +
+	"\x05state\x18\x02 \x01(\tR\x05state\x12!\n" +
+	"\fcurrent_term\x18\x03 \x01(\x04R\vcurrentTerm\x12\x1b\n" +
+	"\tvoted_for\x18\x04 \x01(\tR\bvotedFor\x12\x1b\n" +
+	"\tleader_id\x18\x05 \x01(\tR\bleaderId\x12!\n" +
+	"\fcommit_index\x18\x06 \x01(\x04R\vcommitIndex\x12!\n" +
+	"\flast_applied\x18\a \x01(\x04R\vlastApplied\x12$\n" +
+	"\x0elast_log_index\x18\b \x01(\x04R\flastLogIndex\x12\"\n" +
+	"\rlast_log_term\x18\t \x01(\x04R\vlastLogTerm\x12&\n" +
+	"\x0ffirst_log_index\x18\n" +
+	" \x01(\x04R\rfirstLogIndex\x12\x12\n" +
+	"\x04keys\x18\v \x01(\x04R\x04keys2\xc6\x01\n" +
 	"\x02KV\x12*\n" +
 	"\x03Put\x12\x10.kvpb.PutRequest\x1a\x11.kvpb.PutResponse\x123\n" +
 	"\x06Delete\x12\x13.kvpb.DeleteRequest\x1a\x14.kvpb.DeleteResponse\x12*\n" +
-	"\x03Get\x12\x10.kvpb.GetRequest\x1a\x11.kvpb.GetResponseB,Z*github.com/Abdullah-A-Qazi/RaftDB/rpc/kvpbb\x06proto3"
+	"\x03Get\x12\x10.kvpb.GetRequest\x1a\x11.kvpb.GetResponse\x123\n" +
+	"\x06Status\x12\x13.kvpb.StatusRequest\x1a\x14.kvpb.StatusResponseB,Z*github.com/Abdullah-A-Qazi/RaftDB/rpc/kvpbb\x06proto3"
 
 var (
 	file_rpc_kv_proto_rawDescOnce sync.Once
@@ -419,7 +599,7 @@ func file_rpc_kv_proto_rawDescGZIP() []byte {
 	return file_rpc_kv_proto_rawDescData
 }
 
-var file_rpc_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_rpc_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_rpc_kv_proto_goTypes = []any{
 	(*Redirect)(nil),       // 0: kvpb.Redirect
 	(*PutRequest)(nil),     // 1: kvpb.PutRequest
@@ -428,6 +608,8 @@ var file_rpc_kv_proto_goTypes = []any{
 	(*GetResponse)(nil),    // 4: kvpb.GetResponse
 	(*DeleteRequest)(nil),  // 5: kvpb.DeleteRequest
 	(*DeleteResponse)(nil), // 6: kvpb.DeleteResponse
+	(*StatusRequest)(nil),  // 7: kvpb.StatusRequest
+	(*StatusResponse)(nil), // 8: kvpb.StatusResponse
 }
 var file_rpc_kv_proto_depIdxs = []int32{
 	0, // 0: kvpb.PutResponse.redirect:type_name -> kvpb.Redirect
@@ -436,11 +618,13 @@ var file_rpc_kv_proto_depIdxs = []int32{
 	1, // 3: kvpb.KV.Put:input_type -> kvpb.PutRequest
 	5, // 4: kvpb.KV.Delete:input_type -> kvpb.DeleteRequest
 	3, // 5: kvpb.KV.Get:input_type -> kvpb.GetRequest
-	2, // 6: kvpb.KV.Put:output_type -> kvpb.PutResponse
-	6, // 7: kvpb.KV.Delete:output_type -> kvpb.DeleteResponse
-	4, // 8: kvpb.KV.Get:output_type -> kvpb.GetResponse
-	6, // [6:9] is the sub-list for method output_type
-	3, // [3:6] is the sub-list for method input_type
+	7, // 6: kvpb.KV.Status:input_type -> kvpb.StatusRequest
+	2, // 7: kvpb.KV.Put:output_type -> kvpb.PutResponse
+	6, // 8: kvpb.KV.Delete:output_type -> kvpb.DeleteResponse
+	4, // 9: kvpb.KV.Get:output_type -> kvpb.GetResponse
+	8, // 10: kvpb.KV.Status:output_type -> kvpb.StatusResponse
+	7, // [7:11] is the sub-list for method output_type
+	3, // [3:7] is the sub-list for method input_type
 	3, // [3:3] is the sub-list for extension type_name
 	3, // [3:3] is the sub-list for extension extendee
 	0, // [0:3] is the sub-list for field type_name
@@ -457,7 +641,7 @@ func file_rpc_kv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_rpc_kv_proto_rawDesc), len(file_rpc_kv_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
