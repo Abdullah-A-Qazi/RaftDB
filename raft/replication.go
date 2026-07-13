@@ -171,17 +171,27 @@ func nextIndexAfterRejection(log []LogEntry, prevLogIndex uint64, reply AppendEn
 }
 
 // advanceCommitIndexLocked implements the leader commit rule: find the
-// highest N > commitIndex replicated on a majority (matchIndex for peers,
-// our own log implicitly for ourselves) and commit through it.
+// highest N > commitIndex that is replicated on a majority (matchIndex for
+// peers, our own log implicitly for ourselves) AND belongs to the current
+// term, and commit through it.
 //
-// *** PHASE 3 WILL ADD THE CRITICAL GUARD HERE ***
-// Figure 2 requires additionally: log[N].term == currentTerm. Without it, a
-// leader counting replicas of an *older* term's entry can "commit" an entry
-// that a future leader is still allowed to overwrite — the Figure 8
-// scenario, and the reason this project has a whole phase for safety rules.
-// Until Phase 3 lands, this implementation is deliberately faithful to the
-// paper MINUS that clause, and is unsafe under the exact interleaving
-// Figure 8 describes.
+// The current-term clause (§5.4.2) is the Figure 8 rule, and it is easy to
+// get wrong because majority replication *feels* like enough. It isn't:
+// an old-term entry on a majority can still be overwritten, because a
+// candidate whose log ends in a *higher* term wins elections against
+// majority-holders of the old entry (the election restriction compares
+// terms before lengths). Committing it would acknowledge a write that a
+// legal future leader then erases. An entry of the CURRENT term on a
+// majority is different: any future winner must out-term that majority,
+// which forces its log to already contain the entry.
+//
+// Old-term entries are therefore only ever committed *indirectly*: when a
+// current-term entry above them commits, commitIndex jumps over them (Log
+// Matching guarantees everything below a replicated entry matches too).
+// Consequence, flagged as a liveness quirk in docs/phase-3: a fresh leader
+// with inherited uncommitted entries cannot commit them until its first
+// own-term entry arrives (the paper's fix — an empty no-op entry on
+// election win — is future work; our KV traffic unblocks it naturally).
 //
 // Callers must hold rn.mu.
 func (rn *RaftNode) advanceCommitIndexLocked() {
@@ -189,6 +199,13 @@ func (rn *RaftNode) advanceCommitIndexLocked() {
 		return
 	}
 	for n := rn.lastLogIndex(); n > rn.commitIndex; n-- {
+		if rn.termAt(n) != rn.currentTerm {
+			// Terms only decrease toward the log's head, and no entry can
+			// carry a term above ours (we'd have stepped down on seeing
+			// it) — so everything at n and below is from older terms and
+			// not directly committable. Stop.
+			break
+		}
 		count := 1 // ourselves: our log always contains our own entry at n
 		for _, peer := range rn.peers {
 			if rn.matchIndex[peer] >= n {
