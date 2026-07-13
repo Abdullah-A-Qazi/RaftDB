@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 // RPC receiver implementations, per Figure 2's "RequestVote RPC" and
 // "AppendEntries RPC" boxes plus the "Rules for Servers" that apply to all
 // RPCs. Called by the transport layer (gRPC server in package rpc, or the
@@ -24,10 +26,33 @@ func (rn *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 		return reply
 	}
 
-	// PHASE 3 will add the election restriction here (§5.4.1): deny the
-	// vote unless the candidate's log (args.LastLogTerm/LastLogIndex) is at
-	// least as up-to-date as ours. Deferred per the project plan; harmless
-	// in Phases 1–2 only because logs are empty/uniform.
+	// --- Election restriction (§5.4.1) ---
+	// Deny the vote unless the candidate's log is at least as up-to-date
+	// as ours: compare last entry terms first, lengths only as tiebreaker.
+	//
+	// This single check is what makes elections safe. A committed entry
+	// lives on some majority; a candidate needs votes from some majority;
+	// any two majorities share at least one node. That shared node has the
+	// committed entry, and this check makes it refuse any candidate whose
+	// log lacks it — so no leader can ever be elected that is missing a
+	// committed entry (Leader Completeness, §5.4.3). Without it, a
+	// stale-logged node could win and then "correct" everyone else's logs,
+	// erasing acknowledged writes.
+	//
+	// "Up-to-date" is by (lastLogTerm, lastLogIndex), NOT log length
+	// alone: a longer log can be full of uncommitted junk from a deposed
+	// leader's term, while a shorter log ending in a higher term provably
+	// contains everything committed (higher term = elected later = its
+	// history subsumes the committed prefix).
+	upToDate := args.LastLogTerm > rn.lastLogTerm() ||
+		(args.LastLogTerm == rn.lastLogTerm() && args.LastLogIndex >= rn.lastLogIndex())
+	if !upToDate {
+		// votedFor stays untouched: we haven't voted, and a better
+		// candidate in this same term must still be able to get our vote.
+		// Our election timer is NOT reset either — a candidate that
+		// cannot win must not suppress our own (viable) candidacy.
+		return reply
+	}
 
 	// One vote per term: grant iff we haven't voted in this term, or we
 	// already voted for this same candidate (making retries idempotent).
@@ -124,6 +149,17 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 			// different (deposed) leader and can never commit — Raft
 			// guarantees no committed entry ever conflicts with a current
 			// leader's log, so everything we drop here was uncommitted.
+			//
+			// That guarantee rests on the two §5.4 safety rules (election
+			// restriction + current-term commit); assert it, because the
+			// only way to get here with a committed entry is a safety bug,
+			// and silently erasing acknowledged writes is the one failure
+			// mode this system must never shrug off.
+			if e.Index <= rn.commitIndex {
+				panic(fmt.Sprintf(
+					"raft %s: leader %s (term %d) asks to truncate committed entry %d (commitIndex %d) — Leader Completeness violated",
+					rn.id, args.LeaderID, args.Term, e.Index, rn.commitIndex))
+			}
 			rn.truncateFrom(e.Index)
 		}
 		rn.log = append(rn.log, args.Entries[i:]...)
