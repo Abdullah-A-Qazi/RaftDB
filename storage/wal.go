@@ -162,8 +162,11 @@ func (s *FileStore) LoadEntries() ([]raft.LogEntry, error) {
 		case recordAppend:
 			// Appends must extend the log contiguously. A gap or overlap
 			// here (without a truncate record between) means the WAL
-			// itself is inconsistent — refuse to guess.
-			if want := nextIndex(entries); rec.Index != want {
+			// itself is inconsistent — refuse to guess. (When no entries
+			// are held — a fresh, fully-truncated, or freshly-compacted
+			// WAL — any starting index is accepted; raft validates the
+			// start against its snapshot boundary on recovery.)
+			if want := nextIndex(entries); want != 0 && rec.Index != want {
 				return nil, fmt.Errorf(
 					"storage: wal append record out of order: got index %d, want %d", rec.Index, want)
 			}
@@ -194,9 +197,72 @@ func (s *FileStore) LoadEntries() ([]raft.LogEntry, error) {
 
 func nextIndex(entries []raft.LogEntry) uint64 {
 	if len(entries) == 0 {
-		return 1
+		return 0 // sentinel: any starting index is acceptable
 	}
 	return entries[len(entries)-1].Index + 1
+}
+
+// Compact implements raft.LogStore: atomically replace the WAL's contents
+// with just `entries` — the suffix a snapshot didn't cover. This is where
+// the space that the append-only WAL kept accumulating (dead prefixes,
+// truncate records) is finally reclaimed. Build-then-rename gives the same
+// crash contract as atomicWrite: recovery sees the whole old WAL or the
+// whole new one. The caller (raft) guarantees the covering snapshot is
+// already durable, so losing the old WAL's prefix can never lose state.
+func (s *FileStore) Compact(entries []raft.LogEntry) error {
+	tmp, err := os.CreateTemp(s.dir, walFile+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("storage: creating temp wal: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after the rename succeeds
+
+	for _, e := range entries {
+		rec := walRecord{Type: recordAppend, Term: e.Term, Index: e.Index, Command: e.Command}
+		payload, err := json.Marshal(rec)
+		if err != nil {
+			tmp.Close()
+			return fmt.Errorf("storage: encoding wal record: %w", err)
+		}
+		buf := make([]byte, 8+len(payload))
+		binary.LittleEndian.PutUint32(buf[0:4], uint32(len(payload)))
+		binary.LittleEndian.PutUint32(buf[4:8], crc32.ChecksumIEEE(payload))
+		copy(buf[8:], payload)
+		if _, err := tmp.Write(buf); err != nil {
+			tmp.Close()
+			return fmt.Errorf("storage: writing temp wal: %w", err)
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("storage: syncing temp wal: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("storage: closing temp wal: %w", err)
+	}
+	if err := os.Rename(tmpName, filepath.Join(s.dir, walFile)); err != nil {
+		return fmt.Errorf("storage: swapping wal: %w", err)
+	}
+	if err := syncDir(s.dir); err != nil {
+		return fmt.Errorf("storage: syncing dir: %w", err)
+	}
+
+	// The old handle still points at the unlinked pre-compaction file;
+	// swap it for the new one, positioned at the end for appends.
+	old := s.wal
+	fresh, err := openWAL(s.dir)
+	if err != nil {
+		return err
+	}
+	if _, err := fresh.Seek(0, io.SeekEnd); err != nil {
+		fresh.Close()
+		return fmt.Errorf("storage: seeking new wal: %w", err)
+	}
+	s.wal = fresh
+	if old != nil {
+		old.Close()
+	}
+	return nil
 }
 
 // Close releases the WAL file handle.

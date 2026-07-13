@@ -28,8 +28,16 @@ var ErrNotLeader = errors.New("raft: not the leader")
 // Raft never interprets commands; whatever Apply does must be deterministic,
 // because every node replays the same sequence and must end in the same
 // state.
+//
+// Snapshot and Restore (Phase 5) are called from that same single goroutine,
+// so they are never concurrent with Apply. Snapshot must capture exactly the
+// state produced by the entries applied so far; Restore must replace the
+// entire state with the snapshot's (it always moves the state forward — raft
+// never restores a snapshot older than what is already applied).
 type StateMachine interface {
 	Apply(entry LogEntry)
+	Snapshot() ([]byte, error)
+	Restore(snapshot []byte) error
 }
 
 // State is the role a node is currently playing (§5.1). Every node starts as
@@ -100,6 +108,14 @@ type Config struct {
 	// Transport sends RPCs to peers. Required by Start; may be nil for
 	// tests that only poke the RPC handlers.
 	Transport Transport
+
+	// SnapshotStore persists snapshots and SnapshotThreshold triggers
+	// them: once more than SnapshotThreshold entries have accumulated in
+	// the log beyond the last snapshot, the applier snapshots the state
+	// machine at lastApplied and compacts the log. Threshold 0 (or a nil
+	// store) disables snapshotting entirely — the Phases 0–4 behavior.
+	SnapshotStore     SnapshotStore
+	SnapshotThreshold uint64
 
 	// ElectionTimeoutMin/Max bound the randomized election timeout
 	// (defaults 150–300ms, the paper's suggested range §5.6).
@@ -177,13 +193,17 @@ type RaftNode struct {
 	// None. Persisting it is what enforces "one vote per term".
 	votedFor string
 
-	// log is the replicated log. Slot 0 holds a sentinel entry
-	// {Term: 0, Index: 0} so real entries start at index 1 exactly as in
-	// the paper — this keeps every index formula (prevLogIndex,
-	// commitIndex, "last log index") identical to Figure 2 with no
-	// off-by-one translation. The sentinel is also what prevLogIndex=0
-	// matches against when appending the very first entry.
-	// (In-memory only until Phase 4's WAL; empty in Phase 1 anyway.)
+	// log is the replicated log. Slot 0 always holds a sentinel entry
+	// carrying the (index, term) of the entry *just before* the first
+	// real one — {0, 0} on a fresh node, and the snapshot's
+	// (lastIncludedIndex, lastIncludedTerm) after compaction (Phase 5).
+	// So entry with log index i lives at slice position i - log[0].Index,
+	// and every Figure 2 formula keeps working after compaction because
+	// the three places that translate index→position (termAt,
+	// entriesFrom, truncateLogLocked) all read the base from the
+	// sentinel. Bonus: with the whole log compacted away, lastLogIndex/
+	// lastLogTerm naturally report the snapshot's position — exactly what
+	// elections and the consistency check need (§7).
 	log []LogEntry
 
 	// ---------------------------------------------------------------
@@ -237,8 +257,19 @@ type RaftNode struct {
 	stateMachine StateMachine
 
 	// applyCond (on mu) wakes the applier goroutine whenever commitIndex
-	// advances.
+	// advances or a snapshot is waiting to be restored.
 	applyCond *sync.Cond
+
+	// pendingSnapshot is a snapshot installed by HandleInstallSnapshot
+	// that the applier has not yet fed to the state machine. Restoring
+	// goes through the applier goroutine — the only goroutine allowed to
+	// mutate the state machine — so a restore can never interleave with
+	// an Apply.
+	pendingSnapshot *Snapshot
+
+	// initialSnapshotData is recovered snapshot state waiting for Start
+	// (the state machine isn't wired yet during NewNode).
+	initialSnapshotData []byte
 
 	// triggerCh kicks the leader's replication loop ahead of the next
 	// heartbeat tick — buffered(1) so a kick never blocks and repeated
@@ -299,29 +330,55 @@ func NewNode(cfg Config) (*RaftNode, error) {
 		rn.logger.Info("recovered hard state", "term", rn.currentTerm, "votedFor", rn.votedFor)
 	}
 
-	// Recover the log (Phase 4). commitIndex and lastApplied deliberately
-	// stay 0 — Figure 2 marks them volatile. We re-learn commitIndex from
-	// the next leader's AppendEntries (or by becoming leader), and the
-	// applier then replays the committed prefix into the state machine,
-	// rebuilding it from scratch. Persisting commitIndex would only be an
-	// optimization; persisting the log is what's load-bearing.
+	// Recover the snapshot first (Phase 5): it defines where the log
+	// starts. The sentinel adopts the snapshot's position, and
+	// commitIndex/lastApplied start there rather than at 0 — everything
+	// in a snapshot is committed and applied by construction (only the
+	// applied prefix is ever snapshotted).
+	if cfg.SnapshotStore != nil {
+		snap, found, err := cfg.SnapshotStore.LoadSnapshot()
+		if err != nil {
+			return nil, fmt.Errorf("raft: loading snapshot: %w", err)
+		}
+		if found {
+			rn.log[0] = LogEntry{Term: snap.LastIncludedTerm, Index: snap.LastIncludedIndex}
+			rn.commitIndex = snap.LastIncludedIndex
+			rn.lastApplied = snap.LastIncludedIndex
+			rn.initialSnapshotData = snap.Data
+			rn.logger.Info("recovered snapshot", "lastIncludedIndex", snap.LastIncludedIndex,
+				"lastIncludedTerm", snap.LastIncludedTerm)
+		}
+	}
+
+	// Recover the log (Phase 4). Without a snapshot, commitIndex and
+	// lastApplied stay 0 — Figure 2 marks them volatile; we re-learn
+	// commitIndex from the next leader and the applier replays the
+	// committed prefix into the state machine.
 	if cfg.LogStore != nil {
 		entries, err := cfg.LogStore.LoadEntries()
 		if err != nil {
 			return nil, fmt.Errorf("raft: loading log: %w", err)
 		}
-		for i, e := range entries {
-			// The sentinel occupies slot 0, so entry i must be index i+1;
-			// anything else means the store handed us a corrupt log and
-			// every index formula in this package would be silently wrong.
-			if e.Index != uint64(i)+1 {
-				return nil, fmt.Errorf("raft: recovered log is not contiguous: entry %d has index %d", i, e.Index)
+		base := rn.log[0].Index
+		want := base + 1
+		for _, e := range entries {
+			// Entries at or below the snapshot boundary are leftovers
+			// from a crash between snapshot-save and WAL-compaction; the
+			// snapshot supersedes them.
+			if e.Index <= base {
+				continue
+			}
+			// Beyond the boundary the log must be gap-free, or every
+			// index formula in this package is silently wrong.
+			if e.Index != want {
+				return nil, fmt.Errorf("raft: recovered log is not contiguous: got index %d, want %d", e.Index, want)
 			}
 			rn.log = append(rn.log, e)
+			want++
 		}
-		if len(entries) > 0 {
-			rn.logger.Info("recovered log", "entries", len(entries),
-				"lastIndex", rn.lastLogIndex(), "lastTerm", rn.lastLogTerm())
+		if len(rn.log) > 1 {
+			rn.logger.Info("recovered log", "entries", len(rn.log)-1,
+				"firstIndex", base+1, "lastIndex", rn.lastLogIndex(), "lastTerm", rn.lastLogTerm())
 		}
 	}
 	return rn, nil
@@ -338,6 +395,18 @@ func (rn *RaftNode) Start() error {
 	}
 	if rn.started {
 		return fmt.Errorf("raft: already started")
+	}
+	// A recovered snapshot must be loaded into the state machine before
+	// the applier can run — the applier resumes at lastApplied, which
+	// already sits at the snapshot boundary.
+	if rn.initialSnapshotData != nil {
+		if rn.stateMachine == nil {
+			return fmt.Errorf("raft: recovered a snapshot but no state machine is wired (SetStateMachine before Start)")
+		}
+		if err := rn.stateMachine.Restore(rn.initialSnapshotData); err != nil {
+			return fmt.Errorf("raft: restoring recovered snapshot: %w", err)
+		}
+		rn.initialSnapshotData = nil
 	}
 	rn.started = true
 	rn.resetElectionTimerLocked()
@@ -496,15 +565,25 @@ func (rn *RaftNode) lastLogTerm() uint64 {
 	return rn.log[len(rn.log)-1].Term
 }
 
-// termAt returns the term of the log entry at the given index (0 at the
-// sentinel index 0). While the log is never compacted, a log index IS the
-// slice position (the sentinel keeps them aligned); Phase 5's snapshotting
-// will change that mapping, and centralizing the arithmetic here (and in
-// entriesFrom/truncateFrom) means it changes in one place.
+// firstLogIndex returns the index of the first entry actually present in
+// the log — everything below it lives only in the snapshot. base+1 where
+// base is the sentinel's index.
 //
-// Callers must hold rn.mu and ensure index <= lastLogIndex().
+// Callers must hold rn.mu.
+func (rn *RaftNode) firstLogIndex() uint64 {
+	return rn.log[0].Index + 1
+}
+
+// termAt returns the term of the log entry at the given index. The log
+// index i lives at slice position i - log[0].Index (the sentinel carries
+// the compaction boundary; on an uncompacted log the mapping degenerates to
+// position == index). Asking at the boundary itself returns the snapshot's
+// lastIncludedTerm — which is precisely what the consistency check needs
+// when prevLogIndex lands on it.
+//
+// Callers must hold rn.mu and ensure log[0].Index <= index <= lastLogIndex().
 func (rn *RaftNode) termAt(index uint64) uint64 {
-	return rn.log[index].Term
+	return rn.log[index-rn.log[0].Index].Term
 }
 
 // entriesFrom returns a copy of all entries with index >= from. It must
@@ -512,9 +591,9 @@ func (rn *RaftNode) termAt(index uint64) uint64 {
 // array would otherwise be shared with a log that later gets truncated and
 // re-appended (a data race, and worse, silently mutating in-flight RPCs).
 //
-// Callers must hold rn.mu and ensure from <= lastLogIndex()+1.
+// Callers must hold rn.mu and ensure firstLogIndex() <= from <= lastLogIndex()+1.
 func (rn *RaftNode) entriesFrom(from uint64) []LogEntry {
-	tail := rn.log[from:]
+	tail := rn.log[from-rn.log[0].Index:]
 	if len(tail) == 0 {
 		return nil
 	}
@@ -541,9 +620,9 @@ func (rn *RaftNode) appendLogLocked(entries ...LogEntry) {
 }
 
 // truncateLogLocked drops every entry with index >= from (from must be
-// >= 1; the sentinel is never dropped), durably. Only ever called on
-// conflicting, uncommitted suffixes — see HandleAppendEntries for the
-// guard rails.
+// >= firstLogIndex(); the sentinel is never dropped), durably. Only ever
+// called on conflicting, uncommitted suffixes — see HandleAppendEntries for
+// the guard rails.
 //
 // Callers must hold rn.mu.
 func (rn *RaftNode) truncateLogLocked(from uint64) {
@@ -552,7 +631,32 @@ func (rn *RaftNode) truncateLogLocked(from uint64) {
 			panic(fmt.Sprintf("raft %s: persisting log truncation: %v", rn.id, err))
 		}
 	}
-	rn.log = rn.log[:from]
+	rn.log = rn.log[:from-rn.log[0].Index]
+}
+
+// compactLogLocked drops the log prefix covered by a snapshot at (index,
+// term): the sentinel moves to that position and only entries beyond it
+// remain. The caller must already have made the snapshot durable — after
+// this, those entries exist nowhere else on this node.
+//
+// Callers must hold rn.mu and ensure the snapshot is saved.
+func (rn *RaftNode) compactLogLocked(index, term uint64) {
+	if index <= rn.log[0].Index {
+		return // already compacted at least this far
+	}
+	var suffix []LogEntry
+	if index < rn.lastLogIndex() {
+		suffix = rn.entriesFrom(index + 1)
+	}
+	if rn.cfg.LogStore != nil {
+		// Rewrites the WAL to contain only the suffix — this is the
+		// moment disk space is actually reclaimed.
+		if err := rn.cfg.LogStore.Compact(suffix); err != nil {
+			panic(fmt.Sprintf("raft %s: compacting log: %v", rn.id, err))
+		}
+	}
+	rn.log = append([]LogEntry{{Term: term, Index: index}}, suffix...)
+	rn.logger.Info("compacted log", "throughIndex", index, "remainingEntries", len(suffix))
 }
 
 // quorum returns the majority size for the full cluster (peers + self).
@@ -572,6 +676,10 @@ type Status struct {
 	LastApplied  uint64
 	LastLogIndex uint64
 	LastLogTerm  uint64
+	// FirstLogIndex is the first entry still present in the log; anything
+	// below it has been compacted into a snapshot (1 on an uncompacted
+	// node).
+	FirstLogIndex uint64
 }
 
 // Status returns a consistent snapshot of the node's state.
@@ -579,14 +687,15 @@ func (rn *RaftNode) Status() Status {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 	return Status{
-		ID:           rn.id,
-		State:        rn.state,
-		CurrentTerm:  rn.currentTerm,
-		VotedFor:     rn.votedFor,
-		LeaderID:     rn.leaderID,
-		CommitIndex:  rn.commitIndex,
-		LastApplied:  rn.lastApplied,
-		LastLogIndex: rn.lastLogIndex(),
-		LastLogTerm:  rn.lastLogTerm(),
+		ID:            rn.id,
+		State:         rn.state,
+		CurrentTerm:   rn.currentTerm,
+		VotedFor:      rn.votedFor,
+		LeaderID:      rn.leaderID,
+		CommitIndex:   rn.commitIndex,
+		LastApplied:   rn.lastApplied,
+		LastLogIndex:  rn.lastLogIndex(),
+		LastLogTerm:   rn.lastLogTerm(),
+		FirstLogIndex: rn.firstLogIndex(),
 	}
 }

@@ -74,10 +74,20 @@ func (s *FileStore) SaveHardState(hs raft.HardState) error {
 	if err != nil {
 		return fmt.Errorf("storage: encoding hard state: %w", err)
 	}
+	if err := s.atomicWrite(hardStateFile, data); err != nil {
+		return fmt.Errorf("storage: writing hard state: %w", err)
+	}
+	return nil
+}
 
-	tmp, err := os.CreateTemp(s.dir, hardStateFile+".tmp-*")
+// atomicWrite durably replaces dir/name with data via the temp → fsync →
+// rename → fsync-dir sequence (see SaveHardState's doc comment for why each
+// step matters). Shared by hard state and snapshots — everything
+// overwrite-shaped.
+func (s *FileStore) atomicWrite(name string, data []byte) error {
+	tmp, err := os.CreateTemp(s.dir, name+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("storage: creating temp file: %w", err)
+		return fmt.Errorf("creating temp file: %w", err)
 	}
 	tmpName := tmp.Name()
 	// Best-effort cleanup on any failure path below.
@@ -85,22 +95,19 @@ func (s *FileStore) SaveHardState(hs raft.HardState) error {
 
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		return fmt.Errorf("storage: writing hard state: %w", err)
+		return fmt.Errorf("writing temp file: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return fmt.Errorf("storage: syncing hard state: %w", err)
+		return fmt.Errorf("syncing temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("storage: closing temp file: %w", err)
+		return fmt.Errorf("closing temp file: %w", err)
 	}
-	if err := os.Rename(tmpName, s.path); err != nil {
-		return fmt.Errorf("storage: replacing hard state: %w", err)
+	if err := os.Rename(tmpName, filepath.Join(s.dir, name)); err != nil {
+		return fmt.Errorf("replacing %s: %w", name, err)
 	}
-	if err := syncDir(s.dir); err != nil {
-		return fmt.Errorf("storage: syncing dir: %w", err)
-	}
-	return nil
+	return syncDir(s.dir)
 }
 
 // LoadHardState reads the persisted hard state; found is false on a node

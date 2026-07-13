@@ -13,6 +13,14 @@ type spyLogStore struct {
 	appended  []LogEntry
 	truncates []uint64
 	preloaded []LogEntry
+	compacts  [][]LogEntry
+}
+
+func (s *spyLogStore) Compact(entries []LogEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compacts = append(s.compacts, entries)
+	return nil
 }
 
 func (s *spyLogStore) AppendEntries(entries []LogEntry) error {

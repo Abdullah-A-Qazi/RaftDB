@@ -29,6 +29,8 @@ func main() {
 	configPath := flag.String("config", "cluster.json", "path to the cluster config file")
 	nodeID := flag.String("id", "", "this node's ID (must appear in the config)")
 	dataDir := flag.String("data", "data", "base directory for per-node durable state")
+	snapshotThreshold := flag.Uint64("snapshot-threshold", 1000,
+		"log entries to accumulate before snapshotting and compacting (0 disables)")
 	flag.Parse()
 
 	if *nodeID == "" {
@@ -67,12 +69,14 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	node, err := raft.NewNode(raft.Config{
-		ID:        self.ID,
-		Peers:     peerIDs,
-		Store:     store,
-		LogStore:  store, // FileStore serves both: hardstate.json + wal.log
-		Transport: transport,
-		Logger:    logger,
+		ID:                self.ID,
+		Peers:             peerIDs,
+		Store:             store,
+		LogStore:          store, // FileStore serves all three: hardstate.json + wal.log + snapshot.json
+		SnapshotStore:     store,
+		SnapshotThreshold: *snapshotThreshold,
+		Transport:         transport,
+		Logger:            logger,
 	})
 	if err != nil {
 		log.Fatalf("raftd: %v", err)

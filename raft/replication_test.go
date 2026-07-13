@@ -10,14 +10,30 @@ import (
 
 // recorderSM records applied entries so tests can assert order and content.
 type recorderSM struct {
-	mu      sync.Mutex
-	entries []LogEntry
+	mu       sync.Mutex
+	entries  []LogEntry
+	snapshot []byte // returned by Snapshot; captured by Restore
+	restores int
 }
 
 func (r *recorderSM) Apply(e LogEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.entries = append(r.entries, e)
+}
+
+func (r *recorderSM) Snapshot() ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshot, nil
+}
+
+func (r *recorderSM) Restore(snapshot []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.snapshot = snapshot
+	r.restores++
+	return nil
 }
 
 func (r *recorderSM) indexes() []uint64 {
