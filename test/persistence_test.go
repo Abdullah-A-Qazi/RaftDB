@@ -1,9 +1,11 @@
 package test
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/Abdullah-A-Qazi/RaftDB/raft"
 	"github.com/Abdullah-A-Qazi/RaftDB/storage"
@@ -51,6 +53,62 @@ func TestVoteSurvivesRestart(t *testing.T) {
 	// The original candidate retrying is still fine (idempotent).
 	if r := n2.HandleRequestVote(raft.RequestVoteArgs{Term: 1, CandidateID: "node2"}); !r.VoteGranted {
 		t.Fatal("restarted node denied the candidate it had already voted for")
+	}
+}
+
+// The definitive durability test: stop EVERY node, restart them all, and
+// require every acknowledged write back. With all five processes down there
+// is no live replica to catch anyone up — the data exists nowhere but the
+// WALs, so this passes only if the log genuinely round-trips through disk.
+func TestFullClusterRestartRecoversData(t *testing.T) {
+	c := NewCluster(t, 5)
+	c.WaitForAgreement(5 * time.Second)
+
+	acked := make(map[string]string)
+	for i := range 8 {
+		k, v := fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i)
+		c.MustPut(k, v)
+		acked[k] = v
+	}
+	c.MustDelete("k0")
+	delete(acked, "k0")
+
+	for _, id := range c.ids {
+		c.Stop(id)
+	}
+	for _, id := range c.ids {
+		c.Restart(id)
+	}
+
+	// A restarted node knows its log but not commitIndex (volatile, per
+	// Figure 2). The new leader's first committed own-term entry — via a
+	// write — re-establishes it; until then nothing applies. (This is the
+	// "no no-op entry" liveness quirk from Phase 3, now load-bearing:
+	// without this write the data would sit committed-but-unapplied
+	// indefinitely on an idle cluster.)
+	c.WaitForAgreement(10 * time.Second)
+	c.MustPut("post-restart", "ok")
+	acked["post-restart"] = "ok"
+
+	waitFor(t, 10*time.Second, "all recovered data applied on every node", func() bool {
+		for _, id := range c.ids {
+			store := c.Store(id)
+			if store.Len() != len(acked) {
+				return false
+			}
+			for k, v := range acked {
+				if got, ok := store.Get(k); !ok || got != v {
+					return false
+				}
+			}
+		}
+		return true
+	})
+	// And the delete must have stayed deleted.
+	for _, id := range c.ids {
+		if _, ok := c.Store(id).Get("k0"); ok {
+			t.Fatalf("%s resurrected deleted key k0 from the WAL replay", id)
+		}
 	}
 }
 

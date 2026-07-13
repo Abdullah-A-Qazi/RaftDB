@@ -128,11 +128,9 @@ func TestNoTempFileLitter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Name() != hardStateFile {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
+	for _, e := range entries {
+		if e.Name() != hardStateFile && e.Name() != walFile {
+			t.Fatalf("unexpected file %q in store dir (temp-file litter?)", e.Name())
 		}
-		t.Fatalf("dir contains %v, want only %s", names, hardStateFile)
 	}
 }

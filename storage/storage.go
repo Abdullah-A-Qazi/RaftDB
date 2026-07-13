@@ -19,26 +19,38 @@ import (
 	"github.com/Abdullah-A-Qazi/RaftDB/raft"
 )
 
-// FileStore persists HardState as a single small JSON file, replaced
-// atomically on every save. This is deliberately NOT a WAL (deviation from
-// the phase plan's "simple file-based WAL is fine"): the hard state is two
-// fields that get overwritten, not appended to, so write-temp + fsync +
-// rename is both simpler and fully crash-safe. The append-shaped data — the
-// log — gets a real WAL in Phase 4.
+// FileStore is the durability layer for one node: it implements both
+// raft.StateStore and raft.LogStore, backed by two files in the node's
+// directory with deliberately different shapes:
+//
+//   - hardstate.json — two overwrite-in-place fields (currentTerm,
+//     votedFor), replaced atomically on every save (temp + fsync + rename).
+//   - wal.log — the replicated log as an append-only record stream
+//     (see wal.go).
+//
+// Overwrite-shaped data gets atomic replacement; append-shaped data gets a
+// WAL. Using one mechanism for both would make one of them either unsafe
+// or needlessly slow.
 type FileStore struct {
 	dir  string
 	path string
+	wal  *os.File
 }
 
 const hardStateFile = "hardstate.json"
 
 // NewFileStore creates (if needed) dir and returns a store rooted there.
-// Each node must use its own directory.
+// Each node must use its own directory, and at most one live process may
+// use a directory at a time (no lock file yet — flagged in docs/phase-4).
 func NewFileStore(dir string) (*FileStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("storage: creating %s: %w", dir, err)
 	}
-	return &FileStore{dir: dir, path: filepath.Join(dir, hardStateFile)}, nil
+	wal, err := openWAL(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &FileStore{dir: dir, path: filepath.Join(dir, hardStateFile), wal: wal}, nil
 }
 
 // SaveHardState durably replaces the stored hard state. The sequence is:
