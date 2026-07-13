@@ -34,6 +34,7 @@ const (
 	KV_Put_FullMethodName    = "/kvpb.KV/Put"
 	KV_Delete_FullMethodName = "/kvpb.KV/Delete"
 	KV_Get_FullMethodName    = "/kvpb.KV/Get"
+	KV_Status_FullMethodName = "/kvpb.KV/Status"
 )
 
 // KVClient is the client API for KV service.
@@ -49,6 +50,8 @@ type KVClient interface {
 	// linearizable (a just-deposed leader can serve a stale read) and what
 	// the fixes are (ReadIndex/leases — future work).
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
+	// Status is answered by every node about itself (no redirect).
+	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 }
 
 type kVClient struct {
@@ -89,6 +92,16 @@ func (c *kVClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOpt
 	return out, nil
 }
 
+func (c *kVClient) Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StatusResponse)
+	err := c.cc.Invoke(ctx, KV_Status_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KVServer is the server API for KV service.
 // All implementations must embed UnimplementedKVServer
 // for forward compatibility.
@@ -102,6 +115,8 @@ type KVServer interface {
 	// linearizable (a just-deposed leader can serve a stale read) and what
 	// the fixes are (ReadIndex/leases — future work).
 	Get(context.Context, *GetRequest) (*GetResponse, error)
+	// Status is answered by every node about itself (no redirect).
+	Status(context.Context, *StatusRequest) (*StatusResponse, error)
 	mustEmbedUnimplementedKVServer()
 }
 
@@ -120,6 +135,9 @@ func (UnimplementedKVServer) Delete(context.Context, *DeleteRequest) (*DeleteRes
 }
 func (UnimplementedKVServer) Get(context.Context, *GetRequest) (*GetResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedKVServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Status not implemented")
 }
 func (UnimplementedKVServer) mustEmbedUnimplementedKVServer() {}
 func (UnimplementedKVServer) testEmbeddedByValue()            {}
@@ -196,6 +214,24 @@ func _KV_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{})
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KV_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServer).Status(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KV_Status_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServer).Status(ctx, req.(*StatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KV_ServiceDesc is the grpc.ServiceDesc for KV service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -214,6 +250,10 @@ var KV_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Get",
 			Handler:    _KV_Get_Handler,
+		},
+		{
+			MethodName: "Status",
+			Handler:    _KV_Status_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

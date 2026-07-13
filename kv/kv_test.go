@@ -118,6 +118,26 @@ func TestFollowerRedirectsReads(t *testing.T) {
 	}
 }
 
+func TestStatusReportsOwnView(t *testing.T) {
+	s := newFollowerServer(t)
+	cmd, _ := Command{Op: OpPut, Key: "k", Value: "v"}.Encode()
+	s.Apply(raft.LogEntry{Index: 1, Term: 1, Command: cmd})
+
+	resp, err := s.Status(context.Background(), &kvpb.StatusRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NodeId != "node1" || resp.State != "Follower" {
+		t.Fatalf("status = %s/%s, want node1/Follower", resp.NodeId, resp.State)
+	}
+	if resp.Keys != 1 {
+		t.Fatalf("keys = %d, want 1", resp.Keys)
+	}
+	if resp.FirstLogIndex != 1 {
+		t.Fatalf("firstLogIndex = %d, want 1 (uncompacted)", resp.FirstLogIndex)
+	}
+}
+
 // The (index, term) check in fireWaiter: an entry applied at the waited
 // index but with a different term means the original command was replaced
 // by another leader — the client must get an error, never a false OK.
