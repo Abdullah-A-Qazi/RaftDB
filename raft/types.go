@@ -24,6 +24,32 @@ type StateStore interface {
 	LoadHardState() (hs HardState, found bool, err error)
 }
 
+// LogStore is the durability contract for the replicated log itself: an
+// append-only write-ahead log. Like StateStore, every mutating call must
+// not return until the change is physically on disk (fsync'd) — a follower
+// that acknowledged entries it forgets in a crash breaks the majority
+// arithmetic commitment rests on (the leader counted that follower; if the
+// entry silently vanishes, a "committed" entry may survive on fewer nodes
+// than a quorum).
+//
+// The log is mutated in exactly two ways, so the interface has exactly two
+// mutations: append at the tail, truncate a suffix (never edits in the
+// middle, never truncates a prefix — that's Phase 5 compaction).
+type LogStore interface {
+	// AppendEntries durably appends entries at the tail of the log.
+	AppendEntries(entries []LogEntry) error
+
+	// TruncateSuffix durably removes every entry with index >= from.
+	TruncateSuffix(from uint64) error
+
+	// LoadEntries returns the entire persisted log in index order,
+	// reflecting all prior appends and truncations. Called once at
+	// startup; recovery from a torn final write (crash mid-append) is the
+	// implementation's job — a torn record was never acknowledged to
+	// anyone and must simply be discarded.
+	LoadEntries() ([]LogEntry, error)
+}
+
 // RequestVoteArgs / RequestVoteReply mirror the proto messages in
 // rpc/raft.proto. The core algorithm uses these domain types so it is not
 // coupled to the wire encoding; the rpc package converts at the boundary.

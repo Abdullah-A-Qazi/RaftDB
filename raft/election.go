@@ -86,6 +86,11 @@ func (rn *RaftNode) startElectionLocked() {
 
 			rn.mu.Lock()
 			defer rn.mu.Unlock()
+			// Fire-and-forget reply goroutines can outlive Stop; a
+			// stopped instance must not mutate state or disk.
+			if rn.stopped {
+				return
+			}
 			if reply.Term > rn.currentTerm {
 				// Someone is ahead of us; our candidacy is void (§5.1).
 				rn.becomeFollowerLocked(reply.Term)

@@ -84,6 +84,12 @@ func (rn *RaftNode) handleAppendEntriesReply(peer string, term uint64, args Appe
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
+	// Fire-and-forget reply goroutines can outlive Stop; a stopped
+	// instance must not mutate state or disk.
+	if rn.stopped {
+		return
+	}
+
 	if reply.Term > rn.currentTerm {
 		// A partition healed or we were deposed: someone out there has a
 		// higher term, so we are not a legitimate leader anymore (§5.1).
